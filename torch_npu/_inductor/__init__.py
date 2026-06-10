@@ -33,6 +33,7 @@ elif os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'tilelang':
     from .npu_device import NewNPUDeviceOpOverrides
     from .codecache import patch_cache_base_get_system
     from .utils import patch_is_gpu, patch_has_triton, disable_foreach
+    from .scheduler import patch_scheduler
 
     register_backend_for_device('npu', TileLangScheduling, NPUWrapperCodeGen, CppWrapperNpu)
     register_device_op_overrides('npu', NewNPUDeviceOpOverrides())
@@ -47,6 +48,7 @@ elif os.getenv('TORCHINDUCTOR_NPU_BACKEND', 'default') == 'tilelang':
     patch_cache_base_get_system()
     patch_is_gpu()
     patch_has_triton()  # inductor uses has_triton() to select SIMD scheduling
+    patch_scheduler()
     disable_foreach()
 else:
     import os

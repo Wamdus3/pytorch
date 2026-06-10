@@ -3,6 +3,7 @@ import copy
 import itertools
 import logging
 import math
+import os
 from types import ModuleType
 from typing import cast, Any, Callable, Optional, Sequence, Union
 
@@ -130,42 +131,85 @@ def patch_scheduler():
 
                 fuse_two_nodes(node_key1, node_key2)
 
-        for node1, node2 in self.get_possible_fusions(nodes):
-            # if either node is in a pending fusion, resolve it.
-            # since we iterate on potential fusions based on profitability
-            # the first potential fusion should take precedence.
-            resolve_pending_fusions(node1, node2)
-            node1 = self.get_fused_node(node1)
-            node2 = self.get_fused_node(node2)
+        max_fusion_rounds = (
+            4 if os.environ.get("TORCHINDUCTOR_NPU_BACKEND") == "tilelang" else 1
+        )
+        for _ in range(max_fusion_rounds):
+            fused_any = False
+            pending_fusions.clear()
 
-            if self.can_fuse(node1, node2) and not self.will_fusion_create_cycle(
-                node1, node2
-            ):
-                speedup = self.speedup_by_fusion(node1, node2)
-                if callable(speedup):
-                    pending_fusions[node1] = (speedup, node1, node2)
-                    pending_fusions[node2] = (speedup, node1, node2)
+            possible_fusions = list(self.get_possible_fusions(list(fused_nodes)))
+            if os.environ.get("TORCHINDUCTOR_NPU_BACKEND") == "tilelang":
+                seen_pairs = {
+                    (left.get_name(), right.get_name())
+                    for left, right in possible_fusions
+                }
+                current_nodes = list(fused_nodes)
+                for left in current_nodes:
+                    left_outputs = left.get_buffer_names()
+                    left_uses = left.used_buffer_names()
+                    for right in current_nodes:
+                        if left is right:
+                            continue
+                        pair = (left.get_name(), right.get_name())
+                        if pair in seen_pairs:
+                            continue
+                        if left_outputs & right.used_buffer_names():
+                            possible_fusions.append((left, right))
+                            seen_pairs.add(pair)
+                        elif right.get_buffer_names() & left_uses:
+                            possible_fusions.append((right, left))
+                            seen_pairs.add((right.get_name(), left.get_name()))
+
+            for node1, node2 in possible_fusions:
+                # if either node is in a pending fusion, resolve it.
+                # since we iterate on potential fusions based on profitability
+                # the first potential fusion should take precedence.
+                before = len(fused_nodes)
+                resolve_pending_fusions(node1, node2)
+                fused_any = fused_any or len(fused_nodes) != before
+                node1 = self.get_fused_node(node1)
+                node2 = self.get_fused_node(node2)
+                if node1 is node2:
                     continue
 
-                if not speedup:
+                can_fuse = self.can_fuse(node1, node2)
+                creates_cycle = (
+                    self.will_fusion_create_cycle(node1, node2)
+                    if can_fuse else False
+                )
+
+                if can_fuse and not creates_cycle:
+                    speedup = self.speedup_by_fusion(node1, node2)
+                    if callable(speedup):
+                        pending_fusions[node1] = (speedup, node1, node2)
+                        pending_fusions[node2] = (speedup, node1, node2)
+                        continue
+
+                    if not speedup:
+                        continue
+
+                    fuse_two_nodes(node1, node2)
+                    fused_any = True
+
+            seen_pair_speedup_fn: OrderedSet[Callable[[], bool]] = OrderedSet()
+            for is_speedup_fn, node_key1, node_key2 in pending_fusions.values():
+                if is_speedup_fn in seen_pair_speedup_fn:
                     continue
 
-                fuse_two_nodes(node1, node2)
+                seen_pair_speedup_fn.add(is_speedup_fn)
 
-        seen_pair_speedup_fn: OrderedSet[Callable[[], bool]] = OrderedSet()
-        for is_speedup_fn, node_key1, node_key2 in pending_fusions.values():
-            if is_speedup_fn in seen_pair_speedup_fn:
-                continue
+                assert self.get_fused_node(node_key1) is node_key1
+                assert self.get_fused_node(node_key2) is node_key2
 
-            seen_pair_speedup_fn.add(is_speedup_fn)
+                if is_speedup_fn() and not self.will_fusion_create_cycle(
+                    node_key1, node_key2
+                ):
+                    fuse_two_nodes(node_key1, node_key2)
+                    fused_any = True
 
-            assert self.get_fused_node(node_key1) is node_key1
-            assert self.get_fused_node(node_key2) is node_key2
-
-            if is_speedup_fn() and not self.will_fusion_create_cycle(
-                node_key1, node_key2
-            ):
-                fuse_two_nodes(node_key1, node_key2)
+            if not fused_any:
+                break
 
         nodes = sorted(fused_nodes, key=lambda x: x.min_order)
         nodes = self.topological_sort_schedule(nodes)
