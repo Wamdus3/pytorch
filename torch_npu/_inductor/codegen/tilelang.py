@@ -78,6 +78,7 @@ from torch._inductor.utils import Placeholder, sympy_product
 from torch._inductor.virtualized import ReductionType, StoreMode, V
 
 from .scheduling import NPUTritonScheduling
+from .triton import IterationRangesRootNPUIndex, NPUIndexTritonKernel
 
 
 # ---------------------------------------------------------------------------
@@ -897,7 +898,7 @@ def _is_zero_index(index: sympy.Expr) -> bool:
         return False
 
 
-class TileLangKernel(SIMDKernel):
+class TileLangKernel(NPUIndexTritonKernel):
     """
     Generates a TileLang @T.prim_func body for a fused set of pointwise nodes.
 
@@ -936,6 +937,60 @@ class TileLangKernel(SIMDKernel):
     # SIMDKernel abstract interface
     # ------------------------------------------------------------------
 
+    def want_no_x_dim(self) -> bool:
+        return False
+
+    def initialize_range_tree(self, pid_cache: Optional[dict[str, str]]) -> None:
+        """
+        Use NPUIndex range-tree entries so NPUTritonScheduling's indexing
+        transform can remove/substitute axes, while keeping TileLang's existing
+        x/r0_ prefix convention.
+        """
+        if pid_cache is None:
+            pid_cache = {}
+
+        active_prefixes = [
+            prefix for prefix in ("z", "y", "x", "r0_", "r1_")
+            if prefix in self.numels
+        ]
+        no_r_dim = not self.inside_reduction or not self.features.is_reduction()
+
+        if self.no_x_dim:
+            tensor_dims = ["r0_", "r1_"]
+        elif no_r_dim:
+            tensor_dims = ["z", "y", "x"]
+        else:
+            tensor_dims = ["z", "y", "x", "r0_", "r1_"]
+
+        grid_dims = ["x", "y", "z"]
+        tensor_dim_map = {
+            prefix: idx
+            for idx, prefix in enumerate(p for p in tensor_dims if p in active_prefixes)
+        }
+        grid_dim_map = {
+            prefix: idx
+            for idx, prefix in enumerate(p for p in grid_dims if p in active_prefixes)
+        }
+
+        for i, prefix in enumerate(active_prefixes):
+            is_reduction = prefix.startswith("r")
+            tensor_dim = tensor_dim_map.get(prefix)
+            grid_dim = None if is_reduction else grid_dim_map.get(prefix)
+            index = i if grid_dim is None else grid_dim
+            self.range_trees.append(
+                IterationRangesRootNPUIndex(
+                    f"{prefix}index",
+                    self.numels[prefix],
+                    prefix,
+                    index,
+                    self,
+                    pid_cache=pid_cache,
+                    is_loop=is_reduction and not self.persistent_reduction,
+                    tensor_dim=tensor_dim,
+                    grid_dim=grid_dim,
+                )
+            )
+
     def dtype_to_str(self, dtype: torch.dtype) -> str:
         return tilelang_dtype(dtype)
 
@@ -966,6 +1021,9 @@ class TileLangKernel(SIMDKernel):
     # ------------------------------------------------------------------
 
     def load(self, name: str, index: sympy.Expr) -> TileLangCSEVariable:
+        if name in self.cse.store_cache:
+            return self.cse.store_cache[name]
+
         dtype = V.graph.get_dtype(name)
         if dtype not in _ANY_SUPPORTED_DTYPE:
             raise NotImplementedError(
@@ -2069,7 +2127,9 @@ class TileLangScheduling(NPUTritonScheduling):
             return self._fallback_to_triton(node, str(exc))
 
     def codegen_node_schedule(self, kernel_features, nodes=None):
-        return SIMDScheduling.codegen_node_schedule(self, kernel_features)
+        if nodes is None:
+            nodes = list(kernel_features.scheduler_nodes())
+        return super().codegen_node_schedule(kernel_features, nodes)
 
     @classmethod
     def select_tiling(cls, nodes, numel, reduction_numel=1):
@@ -2087,7 +2147,7 @@ class TileLangScheduling(NPUTritonScheduling):
         node_schedule,
         kernel: TileLangKernel,
         traced_graph_hash: Optional[str] = None,
-    ) -> str:
+    ) -> tuple[str, str]:
         """
         Splice a shape-keyed caching wrapper into ``wrapper.header``.
 
@@ -2111,7 +2171,8 @@ class TileLangScheduling(NPUTritonScheduling):
         wrapper = V.graph.wrapper_code
 
         if src_code in wrapper.src_to_kernel:
-            return wrapper.src_to_kernel[src_code]
+            kernel_name = wrapper.src_to_kernel[src_code]
+            return kernel_name, src_code.replace(str(Placeholder.KERNEL_NAME), kernel_name)
 
         fused_name = (
             get_fused_kernel_name(node_schedule, config.triton.descriptive_names)
@@ -2196,4 +2257,4 @@ class TileLangScheduling(NPUTritonScheduling):
             code.writeline(f"{cache_var}[_key]({', '.join(tensor_call_args)})")
 
         wrapper.header.splice(code.getvalue())
-        return kernel_name
+        return kernel_name, src_code
