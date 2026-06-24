@@ -39,12 +39,13 @@ Op graph tracking:
 
 Known limitations:
 - Only 1-D contiguous pointwise kernels and simple contiguous reductions.
-- No tail guard when xnumel % _XBLOCK != 0.
+- No tail handling when xnumel % _XBLOCK != 0.
 - Ops without a T.v* equivalent raise NotImplementedError (fallback to Triton).
 """
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 from typing import Any, Optional, Sequence
 
@@ -79,7 +80,9 @@ from torch._inductor.utils import Placeholder, sympy_product
 from torch._inductor.virtualized import ReductionType, StoreMode, V
 
 from .scheduling import NPUTritonScheduling
+from .tile_generator import TileGenerator
 from .triton import IterationRangesRootNPUIndex, NPUIndexTritonKernel
+from .triton_utils import NPUKernelType, get_byte_per_numel
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +536,119 @@ class TileLangOverrides(OpOverrides):
 
 _DEFAULT_XBLOCK = 128
 _DEFAULT_REDUCTION_XBLOCK = 8
+_TILELANG_AUTOTUNE_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE"
+_TILELANG_AUTOTUNE_CANDIDATES_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE_CANDIDATES"
+_TILELANG_AUTOTUNE_WARMUP_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE_WARMUP"
+_TILELANG_AUTOTUNE_REP_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE_REP"
+_TILELANG_AUTOTUNE_TIMEOUT_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE_TIMEOUT"
+
+
+def _tilelang_env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _tilelang_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _tilelang_autotune_enabled() -> bool:
+    return _tilelang_env_flag(_TILELANG_AUTOTUNE_ENV, True)
+
+
+def _tilelang_autotune_warmup() -> int:
+    return max(0, _tilelang_env_int(_TILELANG_AUTOTUNE_WARMUP_ENV, 5))
+
+
+def _tilelang_autotune_rep() -> int:
+    return max(1, _tilelang_env_int(_TILELANG_AUTOTUNE_REP_ENV, 30))
+
+
+def _tilelang_autotune_timeout() -> int:
+    return max(1, _tilelang_env_int(_TILELANG_AUTOTUNE_TIMEOUT_ENV, 30))
+
+
+def _tilelang_parse_xblock_candidate_filter() -> Optional[set[int]]:
+    raw = os.getenv(_TILELANG_AUTOTUNE_CANDIDATES_ENV)
+    if raw is None:
+        return None
+    candidates: set[int] = set()
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError:
+            continue
+        if value > 0:
+            candidates.add(value)
+    return candidates or None
+
+
+def _tilelang_xblock_configs(
+    xnumel: int,
+    rnumel: int,
+    *,
+    is_reduction: bool,
+    dtype_bytes: int,
+    buffer_count: int,
+) -> list[dict[str, int]]:
+    """Generate TileLang X0BLOCK configs using Triton-Ascend's TileGenerator."""
+    xnumel = max(1, int(xnumel))
+    rnumel = max(1, int(rnumel))
+    buffer_count = min(max(1, int(buffer_count)), 3)
+
+    dtype = {
+        1: torch.int8,
+        2: torch.float16,
+        4: torch.float32,
+        8: torch.int64,
+    }.get(max(1, int(dtype_bytes)), torch.float32)
+    try:
+        tile_generator = TileGenerator(
+            [xnumel],
+            ["x0"],
+            tiling_axis=[],
+            no_loop_axis=[],
+            split_axis=[0],
+            low_dims=[],
+            persistent_reduction=False,
+            dtype=dtype,
+            npu_kernel_type=NPUKernelType.SIMD,
+            input_ptr_num=buffer_count,
+        )
+        tile_configs = tile_generator.descend_split_tiling()
+    except Exception:
+        tile_configs = []
+
+    allowed = _tilelang_parse_xblock_candidate_filter()
+    configs: list[dict[str, int]] = []
+    seen: set[int] = set()
+    for cfg in tile_configs:
+        x0block = getattr(cfg, "kwargs", {}).get("X0BLOCK")
+        if x0block is None:
+            continue
+        x0block = int(x0block)
+        if allowed is not None and x0block not in allowed:
+            continue
+        if x0block in seen:
+            continue
+        seen.add(x0block)
+        configs.append({"X0BLOCK": x0block})
+
+    fallback_hint = _DEFAULT_REDUCTION_XBLOCK if is_reduction else _DEFAULT_XBLOCK
+    if allowed is None or fallback_hint in allowed:
+        if fallback_hint not in seen:
+            configs.append({"X0BLOCK": fallback_hint})
+    if not configs:
+        configs.append({"X0BLOCK": fallback_hint})
+    return configs
 
 _TILELANG_NPUIR_PASS_CONFIGS = {
     # Triton-Ascend maps metadata["multibuffer"]=True to
@@ -1732,7 +1848,6 @@ class TileLangKernel(NPUIndexTritonKernel):
         if self._reduction_outputs:
             return self._codegen_reduction_kernel(name)
 
-        xblock       = _DEFAULT_XBLOCK
         prim_fn_name = f"{name or str(Placeholder.KERNEL_NAME)}_prim_fn"
 
         argdefs, _, signature, _ = self.args.python_argdefs()
@@ -1758,7 +1873,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         code.writeline("import tilelang.language as T")
         code.writeline("import math as _math")
         code.writeline("")
-        code.writeline(f"_XBLOCK = {xblock}")
+        code.writeline("_XBLOCK = X0BLOCK")
         code.writeline("")
         code.writeline("@T.prim_func")
         code.writeline(f"def {prim_fn_name}(")
@@ -1916,9 +2031,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         code.writeline("import math as _math")
         code.writeline("")
         code.writeline("_RBLOCK = _rnumel")
-        code.writeline(
-            f"_XBLOCK = _math.gcd(_xnumel, {self._static_value_var('XB', sympy.Integer(_DEFAULT_REDUCTION_XBLOCK))})"
-        )
+        code.writeline("_XBLOCK = X0BLOCK")
         matrix_index = self._representative_reduction_matrix_index()
         matrix_local_shape = (
             self._reduction_matrix_local_shape_from_index(matrix_index)
@@ -2801,11 +2914,50 @@ class TileLangScheduling(NPUTritonScheduling):
 
         _, call_args, signature, _ = kernel.args.python_argdefs()
         tensor_call_args = [a for a, s in zip(call_args, signature) if isinstance(s, TensorArg)]
+        output_arg_names = {
+            var
+            for var, _, _ in kernel._tl_outputs.values()
+        }
+        output_arg_indices = [
+            i for i, arg in enumerate(tensor_call_args) if arg in output_arg_names
+        ]
+        if not output_arg_indices and tensor_call_args:
+            output_arg_indices = [-1]
+        normalized_output_arg_indices = {
+            i if i >= 0 else len(tensor_call_args) + i
+            for i in output_arg_indices
+        }
+        profile_input_args = [
+            arg
+            for i, arg in enumerate(tensor_call_args)
+            if i not in normalized_output_arg_indices
+        ]
+        tensor_dtypes = [
+            s.dtype for s in signature if isinstance(s, TensorArg)
+        ]
+        try:
+            dtype_bytes = max(get_byte_per_numel(dtype) for dtype in tensor_dtypes)
+        except Exception:
+            dtype_bytes = 4
+        buffer_count = min(
+            max(
+                len(kernel._tl_inputs)
+                + len(kernel._tl_outputs)
+                + len(kernel._reduction_outputs),
+                1,
+            ),
+            3,
+        )
+        is_reduction_kernel = bool(kernel._reduction_outputs)
+        fallback_xblock_hint = (
+            _DEFAULT_REDUCTION_XBLOCK if is_reduction_kernel else _DEFAULT_XBLOCK
+        )
         active_trees     = kernel.active_range_trees()
         numel_arg_names  = [f"{t.prefix}numel" for t in active_trees]
         static_axis_args = kernel.tilelang_static_axis_args()
         static_axis_arg_names = [name.lstrip("_") for name, _ in static_axis_args]
-        factory_arg_names = numel_arg_names + static_axis_arg_names
+        shape_factory_arg_names = numel_arg_names + static_axis_arg_names
+        factory_arg_names = shape_factory_arg_names + ["X0BLOCK"]
         outer_arg_list   = tensor_call_args + numel_arg_names
 
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
@@ -2833,6 +2985,19 @@ class TileLangScheduling(NPUTritonScheduling):
                 f"_sys.path.insert(0, {tl_pkg_root!r})"
             )
         code.writeline(f"import tilelang as {import_alias}")
+        autotune_enabled_fn = f"_tilelang_autotune_enabled_{suffix}"
+        autotune_warmup_fn = f"_tilelang_autotune_warmup_{suffix}"
+        autotune_rep_fn = f"_tilelang_autotune_rep_{suffix}"
+        autotune_timeout_fn = f"_tilelang_autotune_timeout_{suffix}"
+        xblock_configs_fn = f"_tilelang_xblock_configs_{suffix}"
+        code.writeline(
+            "from torch_npu._inductor.codegen.tilelang import "
+            f"_tilelang_autotune_enabled as {autotune_enabled_fn}, "
+            f"_tilelang_autotune_warmup as {autotune_warmup_fn}, "
+            f"_tilelang_autotune_rep as {autotune_rep_fn}, "
+            f"_tilelang_autotune_timeout as {autotune_timeout_fn}, "
+            f"_tilelang_xblock_configs as {xblock_configs_fn}"
+        )
         code.writeline("")
 
         factory_params = (
@@ -2873,17 +3038,119 @@ class TileLangScheduling(NPUTritonScheduling):
                     code.writeline("_key = ('static',)")
             code.writeline(f"if _key not in {cache_var}:")
             with code.indent():
-                factory_call = (
-                    ", ".join(f"_key[{i}]" for i in range(len(factory_arg_names)))
-                    if factory_arg_names else ""
+                shape_factory_call = (
+                    ", ".join(f"_key[{i}]" for i in range(len(shape_factory_arg_names)))
+                    if shape_factory_arg_names else ""
                 )
-                code.writeline(f"{cache_var}[_key] = {import_alias}.compile(")
+                xnumel_expr = "int(xnumel)" if "xnumel" in numel_arg_names else "1"
+                rnumel_expr = "int(rnumel)" if "rnumel" in numel_arg_names else "1"
+                code.writeline("_compiled_kernel = None")
+                code.writeline(
+                    f"_tilelang_configs = {xblock_configs_fn}("
+                    f"{xnumel_expr}, {rnumel_expr}, "
+                    f"is_reduction={is_reduction_kernel!r}, "
+                    f"dtype_bytes={dtype_bytes!r}, "
+                    f"buffer_count={buffer_count!r})"
+                )
+                code.writeline(
+                    "_tilelang_fallback_hint = ("
+                    f"_tilelang_configs[0]['X0BLOCK'] "
+                    f"if _tilelang_configs else {fallback_xblock_hint!r})"
+                )
+                code.writeline(
+                    f"if {autotune_enabled_fn}() and len(_tilelang_configs) > 1:"
+                )
                 with code.indent():
-                    code.writeline(
-                        f"{factory_fn}({factory_call}), target='npuir', "
-                        f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
+                    code.writeline("try:")
+                    with code.indent():
+                        code.writeline("from tilelang.autotuner import AutoTuner as _TileLangAutoTuner")
+                        code.writeline("def _autotune_factory(X0BLOCK):")
+                        with code.indent():
+                            autotune_factory_args = ", ".join(
+                                [arg for arg in [shape_factory_call, "X0BLOCK"] if arg]
+                            )
+                            code.writeline(f"return {factory_fn}({autotune_factory_args})")
+                        code.writeline("def _tilelang_supply(_params, config=None):")
+                        with code.indent():
+                            code.writeline(f"return [{', '.join(profile_input_args)}]")
+                        code.writeline(
+                            "_tilelang_warmup = "
+                            f"{autotune_warmup_fn}()"
+                        )
+                        code.writeline(
+                            "_tilelang_rep = "
+                            f"{autotune_rep_fn}()"
+                        )
+                        code.writeline(
+                            "_tilelang_timeout = "
+                            f"{autotune_timeout_fn}()"
+                        )
+                        code.writeline(
+                            "_tilelang_tuner = _TileLangAutoTuner.from_kernel("
+                            "_autotune_factory, _tilelang_configs)"
+                        )
+                        code.writeline("_tilelang_tuner.set_compile_args(")
+                        with code.indent():
+                            code.writeline(
+                                f"out_idx={output_arg_indices!r}, target='npuir', "
+                                f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
+                            )
+                        code.writeline(")")
+                        code.writeline("_tilelang_tuner.set_profile_args(")
+                        with code.indent():
+                            code.writeline(
+                                "skip_check=True, cache_input_tensors=False, "
+                                "supply_prog=_tilelang_supply, "
+                                "warmup=_tilelang_warmup, rep=_tilelang_rep, "
+                                "timeout=_tilelang_timeout"
+                            )
+                        code.writeline(")")
+                        code.writeline(
+                            "_tilelang_result = _tilelang_tuner.run("
+                            "warmup=_tilelang_warmup, rep=_tilelang_rep, "
+                            "timeout=_tilelang_timeout)"
+                        )
+                        code.writeline(
+                            "_tilelang_selected_config = getattr(_tilelang_result, 'config', None) or {}"
+                        )
+                        code.writeline(
+                            "_tilelang_selected_hint = _tilelang_selected_config.get("
+                            "'X0BLOCK', _tilelang_fallback_hint)"
+                        )
+                        selected_factory_args = ", ".join(
+                            [arg for arg in [shape_factory_call, "_tilelang_selected_hint"] if arg]
+                        )
+                        code.writeline(f"_compiled_kernel = {import_alias}.compile(")
+                        with code.indent():
+                            code.writeline(
+                                f"{factory_fn}({selected_factory_args}), target='npuir', "
+                                f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
+                            )
+                        code.writeline(")")
+                        code.writeline(
+                            "print('TileLang autotune selected', "
+                            "_tilelang_selected_config)"
+                        )
+                    code.writeline("except Exception as _tilelang_autotune_exc:")
+                    with code.indent():
+                        code.writeline(
+                            "print('TileLang autotune failed, falling back to default compile:', "
+                            "_tilelang_autotune_exc)"
+                        )
+                        code.writeline("_compiled_kernel = None")
+                code.writeline("if _compiled_kernel is None:")
+                with code.indent():
+                    fallback_factory_args = ", ".join(
+                        [arg for arg in [shape_factory_call, "_tilelang_fallback_hint"] if arg]
                     )
-                code.writeline(")")
+                    code.writeline(f"_compiled_kernel = {import_alias}.compile(")
+                    with code.indent():
+                        code.writeline(
+                            f"{factory_fn}({fallback_factory_args}), target='npuir', "
+                            f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
+                        )
+                    code.writeline(")")
+                code.writeline(f"{cache_var}[_key] = _compiled_kernel")
             code.writeline(f"{cache_var}[_key]({', '.join(tensor_call_args)})")
 
         wrapper.header.splice(code.getvalue())
