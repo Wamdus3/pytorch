@@ -1945,6 +1945,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                 "with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):"
             )
             with code.indent():
+                buffer_shapes: dict[str, str] = {}
                 for _, (var, loc, dtype) in self._tl_inputs.items():
                     kind = self._reduction_input_kind(loc)
                     if kind in {"scalar", "row_broadcast"}:
@@ -1952,6 +1953,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                             f"{loc}_brc_src = T.alloc_shared((1, 1), "
                             f"'{tilelang_dtype(dtype)}')"
                         )
+                        buffer_shapes[loc + "_brc_src"] = "(1, 1)"
                     shape = (
                         self._reduction_matrix_local_shape_from_index(
                             self._tl_input_indices.get(loc, sympy.S.Zero)
@@ -1961,6 +1963,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                     code.writeline(
                         f"{loc} = T.alloc_shared({shape}, '{tilelang_dtype(dtype)}')"
                     )
+                    buffer_shapes[loc] = shape
 
                 input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
                 already_allocated = set(input_locs)
@@ -1973,6 +1976,9 @@ class TileLangKernel(NPUIndexTritonKernel):
                         f"{loc} = T.alloc_shared({self._reduction_output_shape(loc, tensor_arg_names)}, "
                         f"'{tilelang_dtype(dtype)}')"
                     )
+                    buffer_shapes[loc] = self._reduction_output_shape(
+                        loc, tensor_arg_names
+                    )
                     already_allocated.add(loc)
                 for loc, (_, dtype) in self._reduction_outputs.items():
                     if loc not in already_allocated:
@@ -1980,6 +1986,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                             f"{loc} = T.alloc_shared({scalar_reduce_shape}, '{tilelang_dtype(dtype)}')"
                         )
                         already_allocated.add(loc)
+                    buffer_shapes[loc] = scalar_reduce_shape
                 code.writeline("")
 
                 for _, (var, loc, _) in self._tl_inputs.items():
@@ -2030,6 +2037,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                                 f"'{tilelang_dtype(dtype)}')"
                             )
                             already_allocated.add(reduce_input)
+                            buffer_shapes[reduce_input] = matrix_local_shape
                         ops_list[-1] = (last_op, last_operands, reduce_input)
                         reusable_expr_bufs[
                             _tilelang_expr_key(
@@ -2047,6 +2055,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                         dtype,
                         scalar_cache,
                         already_allocated,
+                        buffer_shapes,
                     )
 
                     reduce_src = reduce_input if ops_list else src
@@ -2086,6 +2095,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                         dtype,
                         scalar_cache,
                         already_allocated,
+                        buffer_shapes,
                     )
 
                 # ---- scalar epilogue: per-row outputs computed from reduction
@@ -2123,6 +2133,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                         dtype,
                         scalar_cache,
                         already_allocated,
+                        buffer_shapes,
                     )
 
                 code.writeline("")
@@ -2230,6 +2241,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         dtype: torch.dtype,
         scalar_cache: dict[tuple[str, str], str],
         already_allocated: set[str],
+        buffer_shapes: Optional[dict[str, str]] = None,
     ) -> None:
         """
         Emit a linearized vector-op list while reusing temporary TileLang buffers.
@@ -2241,7 +2253,9 @@ class TileLangKernel(NPUIndexTritonKernel):
         protected_buffers = set(already_allocated)
         use_counts: dict[str, int] = {}
         buffer_map: dict[str, str] = {}
-        free_buffers: list[str] = []
+        free_buffers: dict[str, list[str]] = {}
+        if buffer_shapes is None:
+            buffer_shapes = {}
 
         for _op_name, operands, _out_buf in ops_list:
             for operand in operands:
@@ -2260,26 +2274,53 @@ class TileLangKernel(NPUIndexTritonKernel):
                 and buf not in protected_buffers
             )
 
-        def _allocate_buffer(logical_buf: str) -> str:
+        def _operand_shape(operand) -> Optional[str]:
+            if not isinstance(operand, str):
+                return None
+            return buffer_shapes.get(buffer_map.get(operand, operand))
+
+        def _result_shape(
+            op_name: str,
+            operands: list,
+            logical_out_buf: str,
+        ) -> str:
+            if logical_out_buf in buffer_shapes:
+                return buffer_shapes[logical_out_buf]
+            operand_shapes = [
+                shape for shape in (_operand_shape(operand) for operand in operands)
+                if shape is not None
+            ]
+            if op_name in _UNARY_VEC_OPS and operand_shapes:
+                return operand_shapes[0]
+            if local_shape in operand_shapes:
+                return local_shape
+            if operand_shapes:
+                return operand_shapes[0]
+            return local_shape
+
+        def _allocate_buffer(logical_buf: str, shape: str) -> str:
             if logical_buf in buffer_map:
                 return buffer_map[logical_buf]
             if logical_buf in already_allocated:
                 actual_buf = logical_buf
-            elif free_buffers:
-                actual_buf = free_buffers.pop()
+            elif free_buffers.get(shape):
+                actual_buf = free_buffers[shape].pop()
             else:
                 actual_buf = logical_buf
                 code.writeline(
-                    f"{actual_buf} = T.alloc_shared({local_shape}, "
+                    f"{actual_buf} = T.alloc_shared({shape}, "
                     f"'{tilelang_dtype(dtype)}')"
                 )
                 already_allocated.add(actual_buf)
             buffer_map[logical_buf] = actual_buf
+            buffer_shapes[logical_buf] = shape
+            buffer_shapes[actual_buf] = shape
             return actual_buf
 
         for op_name, operands, logical_out_buf in ops_list:
-            out_buf = _allocate_buffer(logical_out_buf)
             resolved_operands = [_resolve_buffer(operand) for operand in operands]
+            shape = _result_shape(op_name, resolved_operands, logical_out_buf)
+            out_buf = _allocate_buffer(logical_out_buf, shape)
             materialized_operands = self._materialize_scalar_operands(
                 code, op_name, resolved_operands, dtype, scalar_cache
             )
@@ -2296,9 +2337,13 @@ class TileLangKernel(NPUIndexTritonKernel):
                     _is_reusable_temp(operand)
                     and actual_operand not in protected_buffers
                     and actual_operand != out_buf
-                    and actual_operand not in free_buffers
+                    and actual_operand not in free_buffers.setdefault(
+                        buffer_shapes.get(actual_operand, local_shape), []
+                    )
                 ):
-                    free_buffers.append(actual_operand)
+                    free_buffers[buffer_shapes.get(actual_operand, local_shape)].append(
+                        actual_operand
+                    )
 
     @staticmethod
     def _emit_vec_op(op_name: str, operands: list, out_buf: str) -> str:
