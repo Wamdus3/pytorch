@@ -51,6 +51,7 @@ from typing import Any, Optional, Sequence
 import sympy
 import torch
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from torch._inductor import config, ir
 from torch._inductor import scheduler as inductor_scheduler
@@ -531,6 +532,14 @@ class TileLangOverrides(OpOverrides):
 # ---------------------------------------------------------------------------
 
 _DEFAULT_XBLOCK = 128
+_DEFAULT_REDUCTION_XBLOCK = 8
+
+_TILELANG_NPUIR_PASS_CONFIGS = {
+    # Triton-Ascend maps metadata["multibuffer"]=True to
+    # --enable-auto-multi-buffer=true. TileLang-Ascend exposes the same
+    # BishengIR option through this pass config key.
+    "npuir.enable_auto_multi_buffer": True,
+}
 
 
 _SUPPORTED_REDUCTIONS = frozenset({"sum", "max", "min"})
@@ -809,6 +818,40 @@ def _is_scalar_literal_operand(operand: Any) -> bool:
     return isinstance(operand, (int, float)) and not isinstance(operand, bool)
 
 
+def _tilelang_expr_key(
+    var,
+    var_bufs: dict,
+    var_ops: dict,
+    var_consts: Optional[dict] = None,
+    _memo: Optional[dict[str, tuple]] = None,
+) -> tuple:
+    """Build a stable key for reusing already materialized TileLang expressions."""
+    if _memo is None:
+        _memo = {}
+
+    var_name = str(var)
+    if var_name in _memo:
+        return _memo[var_name]
+    if var_name in var_bufs:
+        key = ("buf", var_bufs[var_name])
+    elif var_consts and var_name in var_consts:
+        key = ("const", str(var_consts[var_name]))
+    elif var_name in var_ops:
+        op_name, operands = var_ops[var_name]
+        key = (
+            "op",
+            op_name,
+            tuple(
+                _tilelang_expr_key(op, var_bufs, var_ops, var_consts, _memo)
+                for op in operands
+            ),
+        )
+    else:
+        key = ("literal", var_name)
+    _memo[var_name] = key
+    return key
+
+
 def _build_vec_ops(
     var,
     target_buf: str,
@@ -816,6 +859,7 @@ def _build_vec_ops(
     var_bufs: dict,
     var_ops: dict,
     var_consts: Optional[dict] = None,
+    reusable_expr_bufs: Optional[dict[tuple, str]] = None,
     _visited: Optional[set] = None,
 ) -> str:
     """
@@ -845,6 +889,11 @@ def _build_vec_ops(
 
     # Computed var
     if var_name in var_ops:
+        if reusable_expr_bufs is not None:
+            expr_key = _tilelang_expr_key(var, var_bufs, var_ops, var_consts)
+            if expr_key in reusable_expr_bufs:
+                return reusable_expr_bufs[expr_key]
+
         if var_name in _visited:
             return f"_{var_name}_frag"
 
@@ -862,7 +911,16 @@ def _build_vec_ops(
                     resolved.append(var_consts[op_str])
             elif op_str in var_ops:
                 inter_buf = f"_{op_str}_frag"
-                src = _build_vec_ops(op, inter_buf, ops_list, var_bufs, var_ops, var_consts, _visited)
+                src = _build_vec_ops(
+                    op,
+                    inter_buf,
+                    ops_list,
+                    var_bufs,
+                    var_ops,
+                    var_consts,
+                    reusable_expr_bufs,
+                    _visited,
+                )
                 resolved.append(src)
             else:
                 # Raw literal string (e.g. "2.0" passed directly without going through CSE)
@@ -877,9 +935,13 @@ def _build_vec_ops(
     return var_name
 
 
+def _is_reduction_symbol_name(name: str) -> bool:
+    return name == "r" or name == "rindex" or re.match(r"r\d+(?:_|$)", name) is not None
+
+
 def _has_reduction_index(index: sympy.Expr) -> bool:
     return any(
-        re.match(r"r\d+_", getattr(symbol, "name", str(symbol)))
+        _is_reduction_symbol_name(getattr(symbol, "name", str(symbol)))
         for symbol in index.free_symbols
     )
 
@@ -889,6 +951,100 @@ def _has_pointwise_index(index: sympy.Expr) -> bool:
         getattr(symbol, "name", str(symbol)).startswith("x")
         for symbol in index.free_symbols
     )
+
+
+def _dense_reduction_matrix_expected_index(
+    index: sympy.Expr,
+    reduction_numel: sympy.Expr,
+) -> Optional[sympy.Expr]:
+    x_symbols = [
+        symbol for symbol in index.free_symbols
+        if getattr(symbol, "name", str(symbol)).startswith("x")
+    ]
+    r_symbols = [
+        symbol for symbol in index.free_symbols
+        if _is_reduction_symbol_name(getattr(symbol, "name", str(symbol)))
+    ]
+    if len(x_symbols) != 1 or len(r_symbols) != 1:
+        return None
+    return x_symbols[0] * reduction_numel + r_symbols[0]
+
+
+def _is_dense_reduction_matrix_index(
+    index: sympy.Expr,
+    reduction_numel: sympy.Expr,
+) -> bool:
+    expected = _dense_reduction_matrix_expected_index(index, reduction_numel)
+    if expected is None:
+        return False
+    try:
+        return bool(sympy.simplify(index - expected) == 0)
+    except Exception:
+        return index == expected
+
+
+def _tilelang_index_expr(
+    expr: sympy.Expr,
+    pointwise_index: str = "cid",
+    reduction_index: str = "_tl_i",
+    symbol_replacements: Optional[dict[sympy.Symbol, str]] = None,
+) -> str:
+    if symbol_replacements is None:
+        symbol_replacements = {}
+    if isinstance(expr, (int, sympy.Integer)):
+        return str(int(expr))
+    if isinstance(expr, sympy.Symbol):
+        if expr in symbol_replacements:
+            return symbol_replacements[expr]
+        name = getattr(expr, "name", str(expr))
+        if name.startswith("x"):
+            return pointwise_index
+        if _is_reduction_symbol_name(name):
+            return reduction_index
+        return name
+    if isinstance(expr, FloorDiv):
+        return (
+            f"({_tilelang_index_expr(expr.args[0], pointwise_index, reduction_index, symbol_replacements)} "
+            f"// {_tilelang_index_expr(expr.args[1], pointwise_index, reduction_index, symbol_replacements)})"
+        )
+    if isinstance(expr, ModularIndexing):
+        base, divisor, modulus = expr.args
+        base_expr = _tilelang_index_expr(
+            base,
+            pointwise_index,
+            reduction_index,
+            symbol_replacements,
+        )
+        if divisor != 1:
+            base_expr = (
+                f"({base_expr} // "
+                f"{_tilelang_index_expr(divisor, pointwise_index, reduction_index, symbol_replacements)})"
+            )
+        return (
+            f"({base_expr} % "
+            f"{_tilelang_index_expr(modulus, pointwise_index, reduction_index, symbol_replacements)})"
+        )
+    if isinstance(expr, sympy.Add):
+        return "(" + " + ".join(
+            _tilelang_index_expr(
+                arg,
+                pointwise_index,
+                reduction_index,
+                symbol_replacements,
+            )
+            for arg in expr.args
+        ) + ")"
+    if isinstance(expr, sympy.Mul):
+        return "(" + " * ".join(
+            _tilelang_index_expr(
+                arg,
+                pointwise_index,
+                reduction_index,
+                symbol_replacements,
+            )
+            for arg in expr.args
+        ) + ")"
+    return str(expr)
 
 
 def _is_zero_index(index: sympy.Expr) -> bool:
@@ -919,6 +1075,9 @@ class TileLangKernel(NPUIndexTritonKernel):
         self._tl_outputs: dict[str, tuple[str, str, torch.dtype]] = {}
         self._tl_reduction_input_locs: set[str] = set()
         self._tl_input_indices: dict[str, sympy.Expr] = {}
+        self._tl_input_numels: dict[str, sympy.Expr] = {}
+        self._tl_static_axis_vars: dict[sympy.Symbol, tuple[str, sympy.Expr]] = {}
+        self._tl_static_value_vars: dict[tuple[str, str], tuple[str, sympy.Expr]] = {}
         self._pointwise_output_symbols: set[sympy.Symbol] = set()
         self._pointwise_output_index: Optional[sympy.Expr] = None
 
@@ -944,23 +1103,23 @@ class TileLangKernel(NPUIndexTritonKernel):
         """
         Use NPUIndex range-tree entries so NPUTritonScheduling's indexing
         transform can remove/substitute axes, while keeping TileLang's existing
-        x/r0_ prefix convention.
+        x/r prefix convention.
         """
         if pid_cache is None:
             pid_cache = {}
 
         active_prefixes = [
-            prefix for prefix in ("z", "y", "x", "r0_", "r1_")
+            prefix for prefix in ("z", "y", "x", "r")
             if prefix in self.numels
         ]
         no_r_dim = not self.inside_reduction or not self.features.is_reduction()
 
         if self.no_x_dim:
-            tensor_dims = ["r0_", "r1_"]
+            tensor_dims = ["r"]
         elif no_r_dim:
             tensor_dims = ["z", "y", "x"]
         else:
-            tensor_dims = ["z", "y", "x", "r0_", "r1_"]
+            tensor_dims = ["z", "y", "x", "r"]
 
         grid_dims = ["x", "y", "z"]
         tensor_dim_map = {
@@ -1035,6 +1194,12 @@ class TileLangKernel(NPUIndexTritonKernel):
         if name not in self._tl_inputs:
             self._tl_inputs[name] = (var, local_name, dtype)
         self._tl_input_indices[local_name] = index
+        try:
+            self._tl_input_numels[local_name] = sympy_product(
+                V.graph.get_buffer(name).get_size()
+            )
+        except Exception:
+            pass
         if self.inside_reduction:
             if _has_reduction_index(index):
                 self._tl_reduction_input_locs.add(local_name)
@@ -1176,16 +1341,37 @@ class TileLangKernel(NPUIndexTritonKernel):
         return sympy.simplify(coeff)
 
     def _pointwise_broadcast_shape(self, loc: str) -> str:
+        if loc in self._tl_input_numels:
+            return f"({self._static_value_var('B', self._tl_input_numels[loc])},)"
+        index = self._tl_input_indices.get(loc, sympy.S.Zero)
+        modular_terms = list(index.atoms(ModularIndexing))
+        if len(modular_terms) == 1:
+            return f"({self._static_value_var('B', modular_terms[0].args[2])},)"
         factor = self._pointwise_broadcast_factor(loc)
         if factor is None:
             return "(T.ceildiv(_xnumel, _XBLOCK),)"
-        return f"(T.ceildiv(_xnumel, {factor}),)"
+        return f"(T.ceildiv(_xnumel, {self._static_value_var('B', factor)}),)"
 
     def _pointwise_broadcast_load_index(self, loc: str) -> str:
         factor = self._pointwise_broadcast_factor(loc)
         if factor is None:
             return "cid"
-        return f"((cid * _XBLOCK) // {factor})"
+        return f"((cid * _XBLOCK) // {self._static_value_var('B', factor)})"
+
+    def _pointwise_broadcast_lane_index(self, loc: str) -> str:
+        factor = self._pointwise_broadcast_factor(loc)
+        if factor is not None:
+            factor_var = self._static_value_var("B", factor)
+            index = f"((cid * _XBLOCK + _tl_i) // {factor_var})"
+            if loc in self._tl_input_numels:
+                numel_var = self._static_value_var("B", self._tl_input_numels[loc])
+                index = f"({index} % {numel_var})"
+            return index
+        index = self._tl_input_indices.get(loc, sympy.S.Zero)
+        return _tilelang_index_expr(
+            index,
+            pointwise_index="(cid * _XBLOCK + _tl_i)",
+        )
 
     def _reduction_input_kind(self, loc: str) -> str:
         index = self._tl_input_indices.get(loc, sympy.S.Zero)
@@ -1198,6 +1384,289 @@ class TileLangKernel(NPUIndexTritonKernel):
         if has_r:
             return "col_vector"
         return "row_broadcast"
+
+    def _is_dense_reduction_matrix_loc(self, loc: str) -> bool:
+        reduction_numel = self.numels.get("r")
+        if reduction_numel is None:
+            return False
+        return _is_dense_reduction_matrix_index(
+            self._tl_input_indices.get(loc, sympy.S.Zero),
+            reduction_numel,
+        )
+
+    def _reduction_symbol_replacements(
+        self,
+        index: sympy.Expr,
+    ) -> dict[sympy.Symbol, str]:
+        r_symbols = [
+            symbol for symbol in index.free_symbols
+            if _is_reduction_symbol_name(getattr(symbol, "name", str(symbol)))
+        ]
+        if len(r_symbols) <= 1:
+            return {}
+
+        def sort_key(symbol: sympy.Symbol):
+            coeff = sympy.expand(index).coeff(symbol)
+            if coeff is not None and not getattr(coeff, "free_symbols", None):
+                try:
+                    return int(coeff)
+                except Exception:
+                    pass
+            node = (
+                self.range_tree_nodes.get(symbol)
+                or self.range_tree_nodes_removed.get(symbol)
+            )
+            if node is not None:
+                return node.sorted_order or 0
+            return str(symbol)
+
+        ordered = sorted(r_symbols, key=sort_key)
+        replacements: dict[sympy.Symbol, str] = {}
+        factor = 1
+        for i, symbol in enumerate(ordered):
+            node = (
+                self.range_tree_nodes.get(symbol)
+                or self.range_tree_nodes_removed.get(symbol)
+            )
+            if node is None:
+                raise NotImplementedError(
+                    "TileLang reduction could not determine range for "
+                    f"index symbol {symbol}"
+                )
+            try:
+                extent = int(node.length)
+            except Exception as exc:
+                raise NotImplementedError(
+                    "TileLang reduction only supports static expanded "
+                    f"reduction axes; {symbol} has length {node.length}"
+                ) from exc
+
+            if i == 0:
+                replacements[symbol] = f"(_tl_i % {extent})"
+            elif i == len(ordered) - 1:
+                replacements[symbol] = f"(_tl_i // {factor})"
+            else:
+                replacements[symbol] = f"((_tl_i // {factor}) % {extent})"
+            factor *= extent
+        return replacements
+
+    def _axis_extent(self, symbol: sympy.Symbol) -> sympy.Expr:
+        node = (
+            self.range_tree_nodes.get(symbol)
+            or self.range_tree_nodes_removed.get(symbol)
+        )
+        if node is not None:
+            return node.length
+        name = getattr(symbol, "name", str(symbol))
+        if name.startswith("x"):
+            return self.numels.get("x", sympy.S.One)
+        if _is_reduction_symbol_name(name):
+            return self.numels.get("r", sympy.S.One)
+        return sympy.S.One
+
+    def _static_axis_var(self, symbol: sympy.Symbol) -> str:
+        if symbol not in self._tl_static_axis_vars:
+            name = f"_R{len(self._tl_static_axis_vars)}"
+            self._tl_static_axis_vars[symbol] = (name, self._axis_extent(symbol))
+        return self._tl_static_axis_vars[symbol][0]
+
+    def _static_value_var(self, prefix: str, value: sympy.Expr) -> str:
+        key = (prefix, str(value))
+        if key not in self._tl_static_value_vars:
+            name = f"_{prefix}{len(self._tl_static_value_vars)}"
+            self._tl_static_value_vars[key] = (name, value)
+        return self._tl_static_value_vars[key][0]
+
+    def tilelang_static_axis_args(self) -> list[tuple[str, sympy.Expr]]:
+        return list(dict.fromkeys([
+            *self._tl_static_axis_vars.values(),
+            *self._tl_static_value_vars.values(),
+        ]))
+
+    def _index_symbols_by_stride(self, index: sympy.Expr) -> list[sympy.Symbol]:
+        def stride(symbol: sympy.Symbol):
+            coeff = sympy.expand(index).coeff(symbol)
+            if coeff is not None and not getattr(coeff, "free_symbols", None):
+                try:
+                    return int(coeff)
+                except Exception:
+                    pass
+            node = (
+                self.range_tree_nodes.get(symbol)
+                or self.range_tree_nodes_removed.get(symbol)
+            )
+            if node is not None:
+                return node.sorted_order or 0
+            return 0
+
+        symbols = [
+            symbol for symbol in index.free_symbols
+            if getattr(symbol, "name", str(symbol)).startswith("x")
+            or _is_reduction_symbol_name(getattr(symbol, "name", str(symbol)))
+        ]
+        return sorted(symbols, key=stride, reverse=True)
+
+    def _reduction_matrix_symbols(self, index: sympy.Expr) -> list[sympy.Symbol]:
+        return self._index_symbols_by_stride(index)
+
+    def _reduction_matrix_dim_expr(self, symbol: sympy.Symbol, index: sympy.Expr) -> str:
+        symbols = self._reduction_matrix_symbols(index)
+        name = getattr(symbol, "name", str(symbol))
+        if name.startswith("x") and len([
+            s for s in symbols
+            if getattr(s, "name", str(s)).startswith("x")
+        ]) == 1:
+            return "_xnumel"
+        if _is_reduction_symbol_name(name) and len([
+            s for s in symbols
+            if _is_reduction_symbol_name(getattr(s, "name", str(s)))
+        ]) == 1:
+            return "_rnumel"
+        return self._static_axis_var(symbol)
+
+    def _reduction_matrix_local_shape_from_index(self, index: sympy.Expr) -> str:
+        dims: list[str] = []
+        for symbol in self._reduction_matrix_symbols(index):
+            name = getattr(symbol, "name", str(symbol))
+            dims.append("_XBLOCK" if name.startswith("x") else self._reduction_matrix_dim_expr(symbol, index))
+        return f"({', '.join(dims)},)"
+
+    def _reduction_scalar_local_shape_from_index(self, index: sympy.Expr) -> str:
+        dims = [
+            "_XBLOCK" if getattr(symbol, "name", str(symbol)).startswith("x") else "1"
+            for symbol in self._reduction_matrix_symbols(index)
+        ]
+        return f"({', '.join(dims)},)"
+
+    def _reduction_matrix_reduce_dims_from_index(self, index: sympy.Expr) -> str:
+        dims = [
+            str(i)
+            for i, symbol in enumerate(self._reduction_matrix_symbols(index))
+            if _is_reduction_symbol_name(getattr(symbol, "name", str(symbol)))
+        ]
+        return f"[{', '.join(dims)}]"
+
+    def _representative_reduction_matrix_index(self) -> Optional[sympy.Expr]:
+        for loc in self._tl_reduction_input_locs:
+            index = self._tl_input_indices.get(loc, sympy.S.Zero)
+            if _has_pointwise_index(index) and _has_reduction_index(index):
+                return index
+        for loc, index in self._output_indices.items():
+            if _has_pointwise_index(index) and _has_reduction_index(index):
+                return index
+        return None
+
+    def _pointwise_symbol_replacements(
+        self,
+        index: sympy.Expr,
+        pointwise_index: str = "cid",
+    ) -> dict[sympy.Symbol, str]:
+        x_symbols = [
+            symbol for symbol in index.free_symbols
+            if getattr(symbol, "name", str(symbol)).startswith("x")
+        ]
+        if len(x_symbols) <= 1:
+            return {symbol: pointwise_index for symbol in x_symbols}
+
+        ordered = self._index_symbols_by_stride(
+            sum(symbol * sympy.expand(index).coeff(symbol) for symbol in x_symbols)
+        )
+        ordered = [
+            symbol for symbol in ordered
+            if getattr(symbol, "name", str(symbol)).startswith("x")
+        ]
+        replacements: dict[sympy.Symbol, str] = {}
+        factor = 1
+        for i, symbol in enumerate(reversed(ordered)):
+            extent = self._axis_extent(symbol)
+            try:
+                extent_int = int(extent)
+            except Exception as exc:
+                raise NotImplementedError(
+                    "TileLang reduction only supports static expanded "
+                    f"pointwise axes; {symbol} has length {extent}"
+                ) from exc
+            if i == 0:
+                replacements[symbol] = f"(cid % {extent_int})"
+            elif i == len(ordered) - 1:
+                replacements[symbol] = f"(cid // {factor})"
+            else:
+                replacements[symbol] = f"((cid // {factor}) % {extent_int})"
+            factor *= extent_int
+        return replacements
+
+    def _reduction_matrix_shape_from_index(self, index: sympy.Expr) -> str:
+        reduction_numel = self.numels.get("r", sympy.S.One)
+        if _is_dense_reduction_matrix_index(index, reduction_numel):
+            return "(_xnumel, _rnumel)"
+
+        dims: list[str] = []
+        symbols = self._index_symbols_by_stride(index)
+        for symbol in symbols:
+            dims.append(self._reduction_matrix_dim_expr(symbol, index))
+        return f"({', '.join(dims)},)"
+
+    def _reduction_matrix_index_for_output(self, loc: str) -> sympy.Expr:
+        index = self._output_indices.get(loc, sympy.S.Zero)
+        if not (_has_pointwise_index(index) and _has_reduction_index(index)):
+            representative_index = self._representative_reduction_matrix_index()
+            if representative_index is not None:
+                return representative_index
+        return index
+
+    def _reduction_matrix_start_index_tuple(self, index: sympy.Expr) -> str:
+        reduction_numel = self.numels.get("r", sympy.S.One)
+        if _is_dense_reduction_matrix_index(index, reduction_numel):
+            return "cid * _XBLOCK, 0"
+
+        replacements = {}
+        replacements.update(self._pointwise_symbol_replacements(index, "cid * _XBLOCK"))
+        for symbol in index.free_symbols:
+            if _is_reduction_symbol_name(getattr(symbol, "name", str(symbol))):
+                replacements[symbol] = "0"
+        symbols = self._index_symbols_by_stride(index)
+        parts = [
+            _tilelang_index_expr(symbol, symbol_replacements=replacements)
+            for symbol in symbols
+        ]
+        return ", ".join(parts)
+
+    def _emit_reduction_matrix_load(
+        self,
+        code: IndentedBuffer,
+        var: str,
+        loc: str,
+    ) -> None:
+        index = self._tl_input_indices.get(loc, sympy.S.Zero)
+        reduction_numel = self.numels.get("r", sympy.S.One)
+        if _is_dense_reduction_matrix_index(index, reduction_numel):
+            code.writeline(f"T.copy({var}[cid * _XBLOCK, 0], {loc})")
+            return
+        code.writeline(
+            f"T.copy({var}[{self._reduction_matrix_start_index_tuple(index)}], {loc})"
+        )
+
+    def _emit_reduction_matrix_store(
+        self,
+        code: IndentedBuffer,
+        var: str,
+        loc: str,
+    ) -> None:
+        index = self._reduction_matrix_index_for_output(loc)
+        if (
+            self._representative_reduction_matrix_index() is None
+            and _has_reduction_index(index)
+            and not _has_pointwise_index(index)
+        ):
+            code.writeline(f"T.copy({loc}, {var}[0, 0])")
+            return
+        reduction_numel = self.numels.get("r", sympy.S.One)
+        if _is_dense_reduction_matrix_index(index, reduction_numel):
+            code.writeline(f"T.copy({loc}, {var}[cid * _XBLOCK, 0])")
+            return
+        code.writeline(
+            f"T.copy({loc}, {var}[{self._reduction_matrix_start_index_tuple(index)}])"
+        )
 
     def _is_tensor_output_loc(
         self,
@@ -1244,9 +1713,20 @@ class TileLangKernel(NPUIndexTritonKernel):
         loc: str,
         tensor_arg_names: Optional[set[str]] = None,
     ) -> str:
+        index = self._reduction_matrix_index_for_output(loc)
+        if _is_zero_index(index):
+            index = self._representative_reduction_matrix_index()
+        if index is None:
+            return "(1, _RBLOCK)" if self._reduction_output_extent(loc, tensor_arg_names) == "matrix" else "(1, 1)"
         if self._reduction_output_extent(loc, tensor_arg_names) == "matrix":
-            return "(1, _RBLOCK)"
-        return "(1, 1)"
+            if (
+                self._representative_reduction_matrix_index() is None
+                and _has_reduction_index(index)
+                and not _has_pointwise_index(index)
+            ):
+                return "(1, _RBLOCK)"
+            return self._reduction_matrix_local_shape_from_index(index)
+        return self._reduction_scalar_local_shape_from_index(index)
 
     def codegen_kernel(self, name: Optional[str] = None) -> str:
         if self._reduction_outputs:
@@ -1295,7 +1775,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                 # ---- allocate input buffers (L1/shared) ----
                 for _, (var, loc, dtype) in self._tl_inputs.items():
                     kind = self._pointwise_input_kind(loc)
-                    if kind in {"scalar", "broadcast"}:
+                    if kind == "scalar":
                         code.writeline(
                             f"{loc}_brc_src = T.alloc_shared((1,), "
                             f"'{tilelang_dtype(dtype)}')"
@@ -1320,9 +1800,10 @@ class TileLangKernel(NPUIndexTritonKernel):
                         code.writeline(f"T.copy({var}[0], {loc}_brc_src)")
                         code.writeline(f"T.vbrc({loc}_brc_src, {loc})")
                     elif kind == "broadcast":
-                        load_index = self._pointwise_broadcast_load_index(loc)
-                        code.writeline(f"T.copy({var}[{load_index}], {loc}_brc_src)")
-                        code.writeline(f"T.vbrc({loc}_brc_src, {loc})")
+                        load_index = self._pointwise_broadcast_lane_index(loc)
+                        code.writeline("for _tl_i in T.Parallel(_XBLOCK):")
+                        with code.indent():
+                            code.writeline(f"{loc}[_tl_i] = {var}[{load_index}]")
                     else:
                         code.writeline(f"T.copy({var}[cid * _XBLOCK], {loc})")
                 code.writeline("")
@@ -1351,20 +1832,14 @@ class TileLangKernel(NPUIndexTritonKernel):
                     last_op, last_operands, _ = ops_list[-1]
                     ops_list[-1] = (last_op, last_operands, out_loc)
 
-                    for op_name, operands, out_buf in ops_list:
-                        # Allocate intermediate fragment buffers on first use
-                        if out_buf not in already_allocated:
-                            code.writeline(
-                                f"{out_buf} = T.alloc_shared((_XBLOCK,), "
-                                f"'{tilelang_dtype(dtype)}')"
-                            )
-                            already_allocated.add(out_buf)
-
-                        operands = self._materialize_scalar_operands(
-                            code, op_name, operands, dtype, scalar_cache
-                        )
-                        op_str = self._emit_vec_op(op_name, operands, out_buf)
-                        code.writeline(op_str)
+                    self._emit_vec_ops_with_lifetime_reuse(
+                        code,
+                        ops_list,
+                        "(_XBLOCK,)",
+                        dtype,
+                        scalar_cache,
+                        already_allocated,
+                    )
 
                 code.writeline("")
 
@@ -1397,7 +1872,9 @@ class TileLangKernel(NPUIndexTritonKernel):
             elif kind == "col_vector":
                 input_shapes[var] = "(1, _rnumel)"
             else:
-                input_shapes[var] = "(_xnumel, _rnumel)"
+                input_shapes[var] = self._reduction_matrix_shape_from_index(
+                    self._tl_input_indices.get(loc, sympy.S.Zero)
+                )
         output_vars = {
             var for var, _, _ in self._tl_outputs.values()
             if var in tensor_arg_names
@@ -1412,7 +1889,22 @@ class TileLangKernel(NPUIndexTritonKernel):
             if argdef.name in input_vars:
                 shape = input_shapes[argdef.name]
             elif argdef.name in output_vars:
-                shape = "(_xnumel, _rnumel)" if vector_epilogue else "(_xnumel, 1)"
+                if vector_epilogue:
+                    out_loc = next(
+                        loc for _, (var, loc, _) in self._tl_outputs.items()
+                        if var == argdef.name
+                    )
+                    out_index = self._reduction_matrix_index_for_output(out_loc)
+                    if (
+                        self._representative_reduction_matrix_index() is None
+                        and _has_reduction_index(out_index)
+                        and not _has_pointwise_index(out_index)
+                    ):
+                        shape = "(1, _rnumel)"
+                    else:
+                        shape = self._reduction_matrix_shape_from_index(out_index)
+                else:
+                    shape = "(_xnumel, 1)"
             else:
                 shape = "(_xnumel, 1)"
             prim_sig_parts.append(
@@ -1424,6 +1916,22 @@ class TileLangKernel(NPUIndexTritonKernel):
         code.writeline("import math as _math")
         code.writeline("")
         code.writeline("_RBLOCK = _rnumel")
+        code.writeline(
+            f"_XBLOCK = _math.gcd(_xnumel, {self._static_value_var('XB', sympy.Integer(_DEFAULT_REDUCTION_XBLOCK))})"
+        )
+        matrix_index = self._representative_reduction_matrix_index()
+        matrix_local_shape = (
+            self._reduction_matrix_local_shape_from_index(matrix_index)
+            if matrix_index is not None else "(1, _RBLOCK)"
+        )
+        scalar_reduce_shape = (
+            self._reduction_scalar_local_shape_from_index(matrix_index)
+            if matrix_index is not None else "(1, 1)"
+        )
+        reduce_dims = (
+            self._reduction_matrix_reduce_dims_from_index(matrix_index)
+            if matrix_index is not None else "[1]"
+        )
         code.writeline("")
         code.writeline("@T.prim_func")
         code.writeline(f"def {prim_fn_name}(")
@@ -1433,7 +1941,9 @@ class TileLangKernel(NPUIndexTritonKernel):
         code.writeline("):")
 
         with code.indent():
-            code.writeline("with T.Kernel(_xnumel, is_npu=True) as (cid, _):")
+            code.writeline(
+                "with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):"
+            )
             with code.indent():
                 for _, (var, loc, dtype) in self._tl_inputs.items():
                     kind = self._reduction_input_kind(loc)
@@ -1442,13 +1952,20 @@ class TileLangKernel(NPUIndexTritonKernel):
                             f"{loc}_brc_src = T.alloc_shared((1, 1), "
                             f"'{tilelang_dtype(dtype)}')"
                         )
+                    shape = (
+                        self._reduction_matrix_local_shape_from_index(
+                            self._tl_input_indices.get(loc, sympy.S.Zero)
+                        )
+                        if kind == "matrix" else "(1, _RBLOCK)"
+                    )
                     code.writeline(
-                        f"{loc} = T.alloc_shared((1, _RBLOCK), '{tilelang_dtype(dtype)}')"
+                        f"{loc} = T.alloc_shared({shape}, '{tilelang_dtype(dtype)}')"
                     )
 
                 input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
                 already_allocated = set(input_locs)
                 scalar_cache: dict[tuple[str, str], str] = {}
+                reusable_expr_bufs: dict[tuple, str] = {}
                 for _, (var, loc, dtype) in self._tl_outputs.items():
                     if var not in tensor_arg_names:
                         continue
@@ -1460,7 +1977,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                 for loc, (_, dtype) in self._reduction_outputs.items():
                     if loc not in already_allocated:
                         code.writeline(
-                            f"{loc} = T.alloc_shared((1, 1), '{tilelang_dtype(dtype)}')"
+                            f"{loc} = T.alloc_shared({scalar_reduce_shape}, '{tilelang_dtype(dtype)}')"
                         )
                         already_allocated.add(loc)
                 code.writeline("")
@@ -1476,30 +1993,13 @@ class TileLangKernel(NPUIndexTritonKernel):
                     elif kind == "col_vector":
                         code.writeline(f"T.copy({var}[0, 0], {loc})")
                     else:
-                        code.writeline(f"T.copy({var}[cid, 0], {loc})")
+                        self._emit_reduction_matrix_load(code, var, loc)
                 code.writeline("")
 
                 for out_loc, (result_var, dtype) in self._reduction_outputs.items():
                     reduction_type, value, _ = self._reduction_vars[str(result_var)]
                     reduce_input = f"_{result_var}_reduce_in"
                     ops_list: list[tuple] = []
-                    scalar_locs = set(self._reduction_outputs)
-                    broadcasted_scalars: dict[str, str] = {}
-
-                    def _vectorize_for_reduction(operand):
-                        if not isinstance(operand, str) or operand not in scalar_locs:
-                            return operand
-                        if operand not in broadcasted_scalars:
-                            brc_buf = f"{operand}_brc"
-                            if brc_buf not in already_allocated:
-                                code.writeline(
-                                    f"{brc_buf} = T.alloc_shared((1, _RBLOCK), "
-                                    f"'{tilelang_dtype(dtype)}')"
-                                )
-                                already_allocated.add(brc_buf)
-                            code.writeline(f"T.vbrc({operand}, {brc_buf})")
-                            broadcasted_scalars[operand] = brc_buf
-                        return broadcasted_scalars[operand]
 
                     src = _build_vec_ops(
                         value,
@@ -1508,34 +2008,50 @@ class TileLangKernel(NPUIndexTritonKernel):
                         self._var_bufs,
                         self._var_ops,
                         self._var_consts,
+                        reusable_expr_bufs,
                     )
 
                     if ops_list:
-                        if reduce_input not in already_allocated:
+                        last_op, last_operands, _ = ops_list[-1]
+                        if (
+                            last_op == "exp"
+                            and len(last_operands) == 1
+                            and isinstance(last_operands[0], str)
+                            and last_operands[0] not in input_locs
+                            and last_operands[0] not in {
+                                loc for _, loc, _ in self._tl_outputs.values()
+                            }
+                            and last_operands[0] not in self._reduction_outputs
+                        ):
+                            reduce_input = last_operands[0]
+                        elif reduce_input not in already_allocated:
                             code.writeline(
-                                f"{reduce_input} = T.alloc_shared((1, _RBLOCK), "
+                                f"{reduce_input} = T.alloc_shared({matrix_local_shape}, "
                                 f"'{tilelang_dtype(dtype)}')"
                             )
                             already_allocated.add(reduce_input)
-                        last_op, last_operands, _ = ops_list[-1]
                         ops_list[-1] = (last_op, last_operands, reduce_input)
-
-                    for op_name, operands, op_out_buf in ops_list:
-                        if op_out_buf not in already_allocated:
-                            code.writeline(
-                                f"{op_out_buf} = T.alloc_shared((1, _RBLOCK), "
-                                f"'{tilelang_dtype(dtype)}')"
+                        reusable_expr_bufs[
+                            _tilelang_expr_key(
+                                value,
+                                self._var_bufs,
+                                self._var_ops,
+                                self._var_consts,
                             )
-                            already_allocated.add(op_out_buf)
-                        operands = [_vectorize_for_reduction(operand) for operand in operands]
-                        operands = self._materialize_scalar_operands(
-                            code, op_name, operands, dtype, scalar_cache
-                        )
-                        code.writeline(self._emit_vec_op(op_name, operands, op_out_buf))
+                        ] = reduce_input
+
+                    self._emit_vec_ops_with_lifetime_reuse(
+                        code,
+                        ops_list,
+                        matrix_local_shape,
+                        dtype,
+                        scalar_cache,
+                        already_allocated,
+                    )
 
                     reduce_src = reduce_input if ops_list else src
                     code.writeline(
-                        f"T.reduce({reduce_src}, {out_loc}, dims=[1], "
+                        f"T.reduce({reduce_src}, {out_loc}, dims={reduce_dims}, "
                         f"reduce_mode='{reduction_type}')"
                     )
 
@@ -1544,27 +2060,6 @@ class TileLangKernel(NPUIndexTritonKernel):
                         continue
                     out_kind = self._reduction_output_extent(out_loc, tensor_arg_names)
                     ops_list: list[tuple] = []
-                    scalar_locs = set(self._reduction_outputs)
-                    broadcasted_scalars: dict[str, str] = {}
-
-                    def _vectorize_for_epilogue(operand):
-                        if (
-                            out_kind != "matrix"
-                            or not isinstance(operand, str)
-                            or operand not in scalar_locs
-                        ):
-                            return operand
-                        if operand not in broadcasted_scalars:
-                            brc_buf = f"{operand}_brc"
-                            if brc_buf not in already_allocated:
-                                code.writeline(
-                                    f"{brc_buf} = T.alloc_shared((1, _RBLOCK), "
-                                    f"'{tilelang_dtype(dtype)}')"
-                                )
-                                already_allocated.add(brc_buf)
-                            code.writeline(f"T.vbrc({operand}, {brc_buf})")
-                            broadcasted_scalars[operand] = brc_buf
-                        return broadcasted_scalars[operand]
 
                     src = _build_vec_ops(
                         result_var,
@@ -1573,6 +2068,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                         self._var_bufs,
                         self._var_ops,
                         self._var_consts,
+                        reusable_expr_bufs,
                     )
 
                     if not ops_list:
@@ -1583,19 +2079,14 @@ class TileLangKernel(NPUIndexTritonKernel):
                     last_op, last_operands, _ = ops_list[-1]
                     ops_list[-1] = (last_op, last_operands, out_loc)
 
-                    for op_name, operands, op_out_buf in ops_list:
-                        if op_out_buf not in already_allocated:
-                            op_shape = "(1, _RBLOCK)" if out_kind == "matrix" else "(1, 1)"
-                            code.writeline(
-                                f"{op_out_buf} = T.alloc_shared({op_shape}, "
-                                f"'{tilelang_dtype(dtype)}')"
-                            )
-                            already_allocated.add(op_out_buf)
-                        operands = [_vectorize_for_epilogue(operand) for operand in operands]
-                        operands = self._materialize_scalar_operands(
-                            code, op_name, operands, dtype, scalar_cache
-                        )
-                        code.writeline(self._emit_vec_op(op_name, operands, op_out_buf))
+                    self._emit_vec_ops_with_lifetime_reuse(
+                        code,
+                        ops_list,
+                        matrix_local_shape if out_kind == "matrix" else scalar_reduce_shape,
+                        dtype,
+                        scalar_cache,
+                        already_allocated,
+                    )
 
                 # ---- scalar epilogue: per-row outputs computed from reduction
                 # results but with no reduction index in their output index
@@ -1625,23 +2116,23 @@ class TileLangKernel(NPUIndexTritonKernel):
                         continue
                     last_op, last_operands, _ = ops_list[-1]
                     ops_list[-1] = (last_op, last_operands, out_loc)
-                    for op_name, operands, op_out_buf in ops_list:
-                        if op_out_buf not in already_allocated:
-                            code.writeline(
-                                f"{op_out_buf} = T.alloc_shared((1, 1), "
-                                f"'{tilelang_dtype(dtype)}')"
-                            )
-                            already_allocated.add(op_out_buf)
-                        operands = self._materialize_scalar_operands(
-                            code, op_name, operands, dtype, scalar_cache
-                        )
-                        code.writeline(self._emit_vec_op(op_name, operands, op_out_buf))
+                    self._emit_vec_ops_with_lifetime_reuse(
+                        code,
+                        ops_list,
+                        "(1, 1)",
+                        dtype,
+                        scalar_cache,
+                        already_allocated,
+                    )
 
                 code.writeline("")
                 for _, (var, loc, _) in self._tl_outputs.items():
                     if var not in tensor_arg_names:
                         continue
-                    code.writeline(f"T.copy({loc}, {var}[cid, 0])")
+                    if loc in vector_epilogue_locs:
+                        self._emit_reduction_matrix_store(code, var, loc)
+                    else:
+                        code.writeline(f"T.copy({loc}, {var}[cid * _XBLOCK, 0])")
 
         src = code.getvalue()
         print("====== TileLang reduction prim_func ======")
@@ -1730,6 +2221,84 @@ class TileLangKernel(NPUIndexTritonKernel):
             materialized.append(scalar_name)
 
         return materialized
+
+    def _emit_vec_ops_with_lifetime_reuse(
+        self,
+        code: IndentedBuffer,
+        ops_list: list[tuple],
+        local_shape: str,
+        dtype: torch.dtype,
+        scalar_cache: dict[tuple[str, str], str],
+        already_allocated: set[str],
+    ) -> None:
+        """
+        Emit a linearized vector-op list while reusing temporary TileLang buffers.
+
+        Buffers that exist before this emission starts are protected. Only buffers
+        allocated by this op list can be returned to the free list and reused by a
+        later op with the same shape/dtype.
+        """
+        protected_buffers = set(already_allocated)
+        use_counts: dict[str, int] = {}
+        buffer_map: dict[str, str] = {}
+        free_buffers: list[str] = []
+
+        for _op_name, operands, _out_buf in ops_list:
+            for operand in operands:
+                if isinstance(operand, str):
+                    use_counts[operand] = use_counts.get(operand, 0) + 1
+
+        def _resolve_buffer(buf):
+            if isinstance(buf, str):
+                return buffer_map.get(buf, buf)
+            return buf
+
+        def _is_reusable_temp(buf: str) -> bool:
+            return (
+                isinstance(buf, str)
+                and buf.startswith("_")
+                and buf not in protected_buffers
+            )
+
+        def _allocate_buffer(logical_buf: str) -> str:
+            if logical_buf in buffer_map:
+                return buffer_map[logical_buf]
+            if logical_buf in already_allocated:
+                actual_buf = logical_buf
+            elif free_buffers:
+                actual_buf = free_buffers.pop()
+            else:
+                actual_buf = logical_buf
+                code.writeline(
+                    f"{actual_buf} = T.alloc_shared({local_shape}, "
+                    f"'{tilelang_dtype(dtype)}')"
+                )
+                already_allocated.add(actual_buf)
+            buffer_map[logical_buf] = actual_buf
+            return actual_buf
+
+        for op_name, operands, logical_out_buf in ops_list:
+            out_buf = _allocate_buffer(logical_out_buf)
+            resolved_operands = [_resolve_buffer(operand) for operand in operands]
+            materialized_operands = self._materialize_scalar_operands(
+                code, op_name, resolved_operands, dtype, scalar_cache
+            )
+            code.writeline(self._emit_vec_op(op_name, materialized_operands, out_buf))
+
+            for operand in operands:
+                if not isinstance(operand, str):
+                    continue
+                use_counts[operand] = use_counts.get(operand, 0) - 1
+                if use_counts[operand] != 0:
+                    continue
+                actual_operand = _resolve_buffer(operand)
+                if (
+                    _is_reusable_temp(operand)
+                    and actual_operand not in protected_buffers
+                    and actual_operand != out_buf
+                    and actual_operand not in free_buffers
+                ):
+                    free_buffers.append(actual_operand)
 
     @staticmethod
     def _emit_vec_op(op_name: str, operands: list, out_buf: str) -> str:
@@ -1912,7 +2481,8 @@ class TileLangScheduling(NPUTritonScheduling):
                 code.writeline(f"{cache_var}[_key] = {import_alias}.compile(")
                 with code.indent():
                     code.writeline(
-                        f"{factory_fn}(_key[0], _key[1], _key[2]), target='npuir'"
+                        f"{factory_fn}(_key[0], _key[1], _key[2]), target='npuir', "
+                        f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
                     )
                 code.writeline(")")
             code.writeline(f"{cache_var}[_key](A, B, C)")
@@ -2139,7 +2709,7 @@ class TileLangScheduling(NPUTritonScheduling):
             reduction_numel = sympy_product(reduction_numel)
         if str(reduction_numel) == "1":
             return {"x": numel}
-        return {"x": numel, "r0_": reduction_numel}
+        return {"x": numel, "r": reduction_numel}
 
     def define_kernel(
         self,
@@ -2188,6 +2758,9 @@ class TileLangScheduling(NPUTritonScheduling):
         tensor_call_args = [a for a, s in zip(call_args, signature) if isinstance(s, TensorArg)]
         active_trees     = kernel.active_range_trees()
         numel_arg_names  = [f"{t.prefix}numel" for t in active_trees]
+        static_axis_args = kernel.tilelang_static_axis_args()
+        static_axis_arg_names = [name.lstrip("_") for name, _ in static_axis_args]
+        factory_arg_names = numel_arg_names + static_axis_arg_names
         outer_arg_list   = tensor_call_args + numel_arg_names
 
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
@@ -2218,7 +2791,7 @@ class TileLangScheduling(NPUTritonScheduling):
         code.writeline("")
 
         factory_params = (
-            ", ".join(numel_arg_names) if numel_arg_names else "_dummy=None"
+            ", ".join(factory_arg_names) if factory_arg_names else "_dummy=None"
         )
         code.writeline(f"def {factory_fn}({factory_params}):")
         with code.indent():
@@ -2229,6 +2802,8 @@ class TileLangScheduling(NPUTritonScheduling):
                         code.writeline(f"_rnumel = {arg_name}")
             else:
                 code.writeline("_xnumel = 1")
+            for var_name, _extent in static_axis_args:
+                code.writeline(f"{var_name} = {var_name.lstrip('_')}")
             code.splice(src_code)
             code.writeline(f"return {prim_fn_name}")
 
@@ -2239,20 +2814,30 @@ class TileLangScheduling(NPUTritonScheduling):
         code.writeline(f"def {kernel_name}({', '.join(outer_arg_list)}):")
         with code.indent():
             if numel_arg_names:
+                key_items = [f"int({n})" for n in numel_arg_names]
+                key_items.extend(f"int({extent})" for _name, extent in static_axis_args)
                 code.writeline(
-                    f"_key = ({', '.join(f'int({n})' for n in numel_arg_names)},)"
+                    f"_key = ({', '.join(key_items)},)"
                 )
             else:
-                code.writeline("_key = ('static',)")
+                if static_axis_args:
+                    code.writeline(
+                        f"_key = ({', '.join(f'int({extent})' for _name, extent in static_axis_args)},)"
+                    )
+                else:
+                    code.writeline("_key = ('static',)")
             code.writeline(f"if _key not in {cache_var}:")
             with code.indent():
                 factory_call = (
-                    ", ".join(f"_key[{i}]" for i in range(len(numel_arg_names)))
-                    if numel_arg_names else ""
+                    ", ".join(f"_key[{i}]" for i in range(len(factory_arg_names)))
+                    if factory_arg_names else ""
                 )
                 code.writeline(f"{cache_var}[_key] = {import_alias}.compile(")
                 with code.indent():
-                    code.writeline(f"{factory_fn}({factory_call}), target='npuir'")
+                    code.writeline(
+                        f"{factory_fn}({factory_call}), target='npuir', "
+                        f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
+                    )
                 code.writeline(")")
             code.writeline(f"{cache_var}[_key]({', '.join(tensor_call_args)})")
 

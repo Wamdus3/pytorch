@@ -31,6 +31,8 @@ class SplitTiling:
     def is_contiguous_reduction(self):
         def is_contiguous_axis(axis_list):
             axis_set = set(axis_list)
+            if not axis_set:
+                return False
             return len(axis_set) == (max(axis_set) - min(axis_set) + 1)
 
         if self.kernel.numof_reduction_axis() > 1:
