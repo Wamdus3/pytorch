@@ -599,6 +599,14 @@ def _tilelang_xblock_configs(
     is_reduction: bool,
     dtype_bytes: int,
     buffer_count: int,
+    axis_numels: Optional[list[int]] = None,
+    axis_names: Optional[list[str]] = None,
+    tiling_axis: Optional[list[int]] = None,
+    no_loop_axis: Optional[list[int]] = None,
+    split_axis: Optional[list[int]] = None,
+    low_dims: Optional[list[int]] = None,
+    persistent_reduction: bool = False,
+    dual_reduction: bool = False,
 ) -> list[dict[str, int]]:
     """Generate TileLang tiling configs using Triton-Ascend's TileGenerator."""
     xnumel = max(1, int(xnumel))
@@ -614,33 +622,103 @@ def _tilelang_xblock_configs(
     fallback_hint = _DEFAULT_REDUCTION_XBLOCK if is_reduction else _DEFAULT_XBLOCK
     fallback_rblock = min(rnumel, _DEFAULT_REDUCTION_RBLOCK)
 
+    def normalize_axis_numels(values: Optional[list[int]]) -> list[int]:
+        if values is None:
+            return [xnumel, rnumel] if is_reduction else [xnumel]
+        normalized = [max(1, int(value)) for value in values]
+        return normalized or ([xnumel, rnumel] if is_reduction else [xnumel])
+
+    def normalize_axis_names(names: Optional[list[str]], num_axes: int) -> list[str]:
+        if names is not None and len(names) == num_axes:
+            return [str(name) for name in names]
+        if num_axes == 1:
+            return ["x0"]
+        generated: list[str] = []
+        x_count = 0
+        r_count = 0
+        for idx in range(num_axes):
+            if is_reduction and idx == num_axes - 1:
+                generated.append(f"r{r_count}")
+                r_count += 1
+            else:
+                generated.append(f"x{x_count}")
+                x_count += 1
+        return generated
+
+    def normalize_axis_indices(
+        values: Optional[list[int]],
+        default: list[int],
+        num_axes: int,
+    ) -> list[int]:
+        if values is None:
+            values = default
+        result: list[int] = []
+        for value in values:
+            index = int(value)
+            if 0 <= index < num_axes and index not in result:
+                result.append(index)
+        return result
+
+    def first_config_value(
+        cfg_kwargs: dict[str, Any],
+        prefix: str,
+        suffix: str,
+    ) -> Optional[int]:
+        exact = f"{prefix}0{suffix}"
+        if exact in cfg_kwargs:
+            return int(cfg_kwargs[exact])
+        for key in sorted(cfg_kwargs):
+            if key.startswith(prefix) and key.endswith(suffix):
+                return int(cfg_kwargs[key])
+        return None
+
+    tile_axis_numels = normalize_axis_numels(axis_numels)
+    tile_axis_names = normalize_axis_names(axis_names, len(tile_axis_numels))
+    tile_split_axis = normalize_axis_indices(
+        split_axis,
+        [0, 1] if is_reduction and len(tile_axis_numels) > 1 else [0],
+        len(tile_axis_numels),
+    )
+    tile_tiling_axis = normalize_axis_indices(
+        tiling_axis,
+        [0] if not is_reduction else [],
+        len(tile_axis_numels),
+    )
+    tile_no_loop_axis = normalize_axis_indices(
+        no_loop_axis,
+        [],
+        len(tile_axis_numels),
+    )
+    tile_low_dims = normalize_axis_indices(
+        low_dims,
+        [],
+        len(tile_axis_numels),
+    )
+    reduce_axis_no_loop = bool(
+        is_reduction
+        and any(
+            axis in tile_no_loop_axis
+            and tile_axis_names[axis].startswith("r")
+            for axis in range(len(tile_axis_names))
+        )
+    )
+    if reduce_axis_no_loop:
+        fallback_rblock = rnumel
+
     try:
-        if is_reduction:
-            tile_generator = TileGenerator(
-                [xnumel, rnumel],
-                ["x0", "r0"],
-                tiling_axis=[],
-                no_loop_axis=[],
-                split_axis=[0, 1],
-                low_dims=[],
-                persistent_reduction=False,
-                dtype=dtype,
-                npu_kernel_type=NPUKernelType.SIMD,
-                input_ptr_num=buffer_count,
-            )
-        else:
-            tile_generator = TileGenerator(
-                [xnumel],
-                ["x0"],
-                tiling_axis=[0],
-                no_loop_axis=[],
-                split_axis=[0],
-                low_dims=[],
-                persistent_reduction=False,
-                dtype=dtype,
-                npu_kernel_type=NPUKernelType.SIMD,
-                input_ptr_num=buffer_count,
-            )
+        tile_generator = TileGenerator(
+            tile_axis_numels,
+            tile_axis_names,
+            tiling_axis=tile_tiling_axis,
+            no_loop_axis=tile_no_loop_axis,
+            split_axis=tile_split_axis,
+            low_dims=tile_low_dims,
+            persistent_reduction=bool(persistent_reduction),
+            dtype=dtype,
+            npu_kernel_type=NPUKernelType.SIMD,
+            input_ptr_num=buffer_count,
+            dual_reduction=bool(dual_reduction),
+        )
         tile_configs = tile_generator.descend_split_tiling()
     except Exception:
         tile_configs = []
@@ -668,12 +746,18 @@ def _tilelang_xblock_configs(
     seen: set[tuple[int, int, int]] = set()
     for cfg in tile_configs:
         cfg_kwargs = getattr(cfg, "kwargs", {})
-        x0block = cfg_kwargs.get("X0BLOCK")
+        x0block = first_config_value(cfg_kwargs, "X", "BLOCK")
         if x0block is None:
             continue
         x0block = int(x0block)
-        x0block_sub = int(cfg_kwargs.get("X0BLOCK_SUB", x0block))
-        r0block = int(cfg_kwargs.get("R0BLOCK", fallback_rblock))
+        x0block_sub = first_config_value(cfg_kwargs, "X", "BLOCK_SUB")
+        x0block_sub = int(x0block_sub if x0block_sub is not None else x0block)
+        r0block = first_config_value(cfg_kwargs, "R", "BLOCK")
+        if r0block is None:
+            r0block = first_config_value(cfg_kwargs, "R", "BLOCK_SUB")
+        r0block = int(r0block if r0block is not None else fallback_rblock)
+        if reduce_axis_no_loop:
+            r0block = rnumel
         r0block = min(max(1, r0block), rnumel)
         if allowed is not None and x0block not in allowed:
             continue
@@ -2187,6 +2271,11 @@ class TileLangKernel(NPUIndexTritonKernel):
             self._reduction_matrix_reduce_size_from_index(matrix_index)
             if matrix_index is not None else "[1, _remain_R]"
         )
+        reduce_axis_no_loop = any(
+            getattr(axis, "prefix", "") == "r"
+            and getattr(axis, "is_no_loop_axis", False)
+            for axis in getattr(self, "tiling_axis", [])
+        )
         code.writeline("")
         code.writeline("@T.prim_func")
         code.writeline(f"def {prim_fn_name}(")
@@ -2346,20 +2435,21 @@ class TileLangKernel(NPUIndexTritonKernel):
                             )
     
                         code.writeline("_r_base = 0")
-                        code.writeline("_remain_R = T.min(_RBLOCK, _rnumel)")
-                        emit_reduction_pass(True)
-                        code.writeline("for _tl_r in T.serial(1, T.ceildiv(_rnumel, _RBLOCK)):")
-                        with code.indent():
-                            code.writeline("_r_base = _tl_r * _RBLOCK")
-                            code.writeline("_remain_R = T.min(_RBLOCK, _rnumel - _r_base)")
-                            emit_reduction_pass(False)
+                        if reduce_axis_no_loop:
+                            code.writeline("_remain_R = _rnumel")
+                            emit_reduction_pass(True)
+                        else:
+                            code.writeline("_remain_R = T.min(_RBLOCK, _rnumel)")
+                            emit_reduction_pass(True)
+                            code.writeline("for _tl_r in T.serial(1, T.ceildiv(_rnumel, _RBLOCK)):")
+                            with code.indent():
+                                code.writeline("_r_base = _tl_r * _RBLOCK")
+                                code.writeline("_remain_R = T.min(_RBLOCK, _rnumel - _r_base)")
+                                emit_reduction_pass(False)
                         code.writeline("")
     
                     if vector_epilogue_locs:
-                        code.writeline("for _tl_r in T.serial(T.ceildiv(_rnumel, _RBLOCK)):")
-                        with code.indent():
-                            code.writeline("_r_base = _tl_r * _RBLOCK")
-                            code.writeline("_remain_R = T.min(_RBLOCK, _rnumel - _r_base)")
+                        def emit_vector_epilogue_tile() -> None:
                             emit_r_tile_loads()
     
                             for out_loc, (result_var, dtype) in self._output_vars.items():
@@ -2401,6 +2491,17 @@ class TileLangKernel(NPUIndexTritonKernel):
                                     self._emit_reduction_matrix_store(
                                         code, var, loc, "_remain_X", "_tl_base", "_r_base", "_remain_R"
                                     )
+
+                        if reduce_axis_no_loop:
+                            code.writeline("_r_base = 0")
+                            code.writeline("_remain_R = _rnumel")
+                            emit_vector_epilogue_tile()
+                        else:
+                            code.writeline("for _tl_r in T.serial(T.ceildiv(_rnumel, _RBLOCK)):")
+                            with code.indent():
+                                code.writeline("_r_base = _tl_r * _RBLOCK")
+                                code.writeline("_remain_R = T.min(_RBLOCK, _rnumel - _r_base)")
+                                emit_vector_epilogue_tile()
                         code.writeline("")
     
                     # ---- scalar epilogue: per-row outputs computed from reduction
@@ -3156,6 +3257,26 @@ class TileLangScheduling(NPUTritonScheduling):
             tiling_arg_names.append("R0BLOCK")
         factory_arg_names = shape_factory_arg_names + tiling_arg_names
         outer_arg_list   = tensor_call_args + numel_arg_names
+        tilelang_sorted_axis = list(getattr(kernel, "sorted_axis", []) or [])
+        tilelang_axis_names = [axis.name for axis in tilelang_sorted_axis]
+        tilelang_tiling_axis = [
+            axis.sorted_order for axis in getattr(kernel, "tiling_axis", [])
+            if axis.sorted_order is not None
+        ]
+        tilelang_no_loop_axis = [
+            axis.sorted_order for axis in getattr(kernel, "tiling_axis", [])
+            if axis.sorted_order is not None and getattr(axis, "is_no_loop_axis", False)
+        ]
+        tilelang_split_axis = [
+            axis.sorted_order for axis in getattr(kernel, "split_axis", [])
+            if axis.sorted_order is not None
+        ]
+        tilelang_low_dims = sorted(int(dim) for dim in getattr(kernel, "low_dims", set()))
+        tilelang_persistent_reduction = bool(getattr(kernel, "persistent_reduction", False))
+        try:
+            tilelang_dual_reduction = bool(kernel.numof_reduction_axis() > 1)
+        except Exception:
+            tilelang_dual_reduction = False
 
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
         meta_comment = f"{origins}\n{detailed}".strip()
@@ -3241,13 +3362,30 @@ class TileLangScheduling(NPUTritonScheduling):
                 )
                 xnumel_expr = "int(xnumel)" if "xnumel" in numel_arg_names else "1"
                 rnumel_expr = "int(rnumel)" if "rnumel" in numel_arg_names else "1"
+                axis_numel_exprs: list[str] = []
+                for axis in tilelang_sorted_axis:
+                    if axis.prefix == "r":
+                        axis_numel_exprs.append(rnumel_expr)
+                    else:
+                        axis_numel_exprs.append(xnumel_expr)
+                if not axis_numel_exprs:
+                    axis_numel_exprs = [xnumel_expr, rnumel_expr] if is_reduction_kernel else [xnumel_expr]
+                axis_numels_expr = f"[{', '.join(axis_numel_exprs)}]"
                 code.writeline("_compiled_kernel = None")
                 code.writeline(
                     f"_tilelang_configs = {xblock_configs_fn}("
                     f"{xnumel_expr}, {rnumel_expr}, "
                     f"is_reduction={is_reduction_kernel!r}, "
                     f"dtype_bytes={dtype_bytes!r}, "
-                    f"buffer_count={buffer_count!r})"
+                    f"buffer_count={buffer_count!r}, "
+                    f"axis_numels={axis_numels_expr}, "
+                    f"axis_names={tilelang_axis_names!r}, "
+                    f"tiling_axis={tilelang_tiling_axis!r}, "
+                    f"no_loop_axis={tilelang_no_loop_axis!r}, "
+                    f"split_axis={tilelang_split_axis!r}, "
+                    f"low_dims={tilelang_low_dims!r}, "
+                    f"persistent_reduction={tilelang_persistent_reduction!r}, "
+                    f"dual_reduction={tilelang_dual_reduction!r})"
                 )
                 code.writeline(
                     "_tilelang_fallback_x0block = ("
