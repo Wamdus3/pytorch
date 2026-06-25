@@ -1882,6 +1882,7 @@ class TileLangKernel(NPUIndexTritonKernel):
             vector_len: str,
             base_index: str,
             pointwise_index: str,
+            copy_len: str,
         ) -> None:
             # ---- allocate input buffers (L1/shared) ----
             for _, (var, loc, dtype) in self._tl_inputs.items():
@@ -1915,11 +1916,14 @@ class TileLangKernel(NPUIndexTritonKernel):
                         loc,
                         pointwise_index=pointwise_index,
                     )
-                    code.writeline(f"for _tl_i in T.Parallel({vector_len}):")
+                    code.writeline(f"for _tl_i in T.Parallel({copy_len}):")
                     with code.indent():
                         code.writeline(f"{loc}[_tl_i] = {var}[{load_index}]")
                 else:
-                    code.writeline(f"T.copy({var}[{base_index}], {loc})")
+                    code.writeline(
+                        f"T.copy({var}[{base_index}:{base_index} + {copy_len}], "
+                        f"{loc}[0:{copy_len}])"
+                    )
             code.writeline("")
 
             # ---- emit NPU vector ops ----
@@ -1959,7 +1963,10 @@ class TileLangKernel(NPUIndexTritonKernel):
 
             # ---- T.copy: fragment -> GM for every output ----
             for _, (var, loc, _) in self._tl_outputs.items():
-                code.writeline(f"T.copy({loc}, {var}[{base_index}])")
+                code.writeline(
+                    f"T.copy({loc}[0:{copy_len}], "
+                    f"{var}[{base_index}:{base_index} + {copy_len}])"
+                )
 
         def emit_pointwise_prim_func(code: IndentedBuffer) -> None:
             code.writeline("@T.prim_func")
@@ -1974,15 +1981,24 @@ class TileLangKernel(NPUIndexTritonKernel):
                     "with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):"
                 )
                 with code.indent():
+                    code.writeline("_tl_outer_remain = T.min(_XBLOCK, _xnumel - cid * _XBLOCK)")
                     code.writeline(
-                        "for _tl_block in T.serial(T.ceildiv(_XBLOCK, _XBLOCK_SUB)):"
+                        "for _tl_block in T.serial(T.ceildiv(_tl_outer_remain, _XBLOCK_SUB)):"
                     )
                     with code.indent():
+                        code.writeline("_tl_base = cid * _XBLOCK + _tl_block * _XBLOCK_SUB")
+                        code.writeline(
+                            "_remain_X = T.min("
+                            "_XBLOCK_SUB, "
+                            "T.min(_XBLOCK - _tl_block * _XBLOCK_SUB, _xnumel - _tl_base)"
+                            ")"
+                        )
                         emit_pointwise_body(
                             code,
                             "_XBLOCK_SUB",
-                            "cid * _XBLOCK + _tl_block * _XBLOCK_SUB",
-                            "(cid * _XBLOCK + _tl_block * _XBLOCK_SUB + _tl_i)",
+                            "_tl_base",
+                            "(_tl_base + _tl_i)",
+                            "_remain_X",
                         )
 
         code = IndentedBuffer()
