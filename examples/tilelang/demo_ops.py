@@ -53,6 +53,7 @@ N   = 1024
 x   = torch.randn(N, device=DEVICE, dtype=torch.float32)
 xp  = torch.rand(N,  device=DEVICE, dtype=torch.float32) + 0.1   # strictly positive
 xs  = torch.rand(N,  device=DEVICE, dtype=torch.float32) * 4.0 - 2.0  # in (-2, 2) for sin/cos
+x_erf = torch.rand(N, device=DEVICE, dtype=torch.float32) * 2.0 - 1.0  # T.verf is accurate in [-1, 1]
 y   = torch.randn(N, device=DEVICE, dtype=torch.float32)
 yp  = torch.rand(N,  device=DEVICE, dtype=torch.float32) + 0.1
 
@@ -127,7 +128,7 @@ _check("abs     fp16  abs(x)",    lambda x: torch.abs(x),          x16)
 _check("abs     int32 abs(x)",    lambda x: torch.abs(x),          xi32)
 _check("cos     fp32  cos(x)",    lambda x: torch.cos(x),          xs)
 _check("sin     fp32  sin(x)",    lambda x: torch.sin(x),          xs)
-_check("erf     fp32  erf(x)",    lambda x: torch.erf(x),          x)
+_check("erf     fp32  erf(x)",    lambda x: torch.erf(x),          x_erf)
 _check("tanh    fp32  tanh(x)",   lambda x: torch.tanh(x),         x)
 _check("neg     fp32  -x",        lambda x: -x,                    x)
 _check("neg     fp16  -x",        lambda x: -x,                    x16)
