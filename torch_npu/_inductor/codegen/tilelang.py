@@ -1,4 +1,4 @@
-"""
+﻿"""
 TileLang codegen backend for torch_npu inductor (Ascend NPU).
 
 Generates TileLang @T.prim_func kernels compiled via
@@ -108,7 +108,7 @@ def tilelang_dtype(dtype: torch.dtype) -> str:
 
 
 # ---------------------------------------------------------------------------
-# NPU vector op mappings  (op_name → (tilelang_fn, supported_dtypes))
+# NPU vector op mappings  (op_name 鈫?(tilelang_fn, supported_dtypes))
 #
 # Dtype support sourced from tilelang-mlir-ascend/docs/Tilelang.language/
 # Only dtypes reachable through inductor (no uint16 / uint32 / float64 paths).
@@ -133,7 +133,7 @@ _BINARY_VEC_OPS: dict[str, tuple[str, frozenset]] = {
     "pow":         ("vpow", frozenset({torch.int32})),
     "bitwise_and": ("vand", frozenset({torch.int8, torch.int64,
                                        torch.float16, torch.float32, torch.bool})),
-    "bitwise_or":  ("vor",  frozenset()),   # uint16 only — not reachable via inductor
+    "bitwise_or":  ("vor",  frozenset()),   # uint16 only 鈥?not reachable via inductor
     "bitwise_xor": ("vxor", frozenset()),   # same
 }
 
@@ -155,7 +155,7 @@ _UNARY_VEC_OPS: dict[str, tuple[str, frozenset]] = {
     "tanh":    ("vtanh",    _FP),
 }
 
-# Union of all dtypes supported by at least one op — used as early gate in load().
+# Union of all dtypes supported by at least one op 鈥?used as early gate in load().
 _ANY_SUPPORTED_DTYPE: frozenset[torch.dtype] = frozenset().union(
     *[s for _, s in _BINARY_VEC_OPS.values()],
     *[s for _, s in _UNARY_VEC_OPS.values()],
@@ -715,7 +715,7 @@ _SUPPORTED_REDUCTIONS = frozenset({"sum", "max", "min"})
 # Matmul (T.gemm) codegen
 # ---------------------------------------------------------------------------
 
-# Accumulation dtype for T.gemm: fp16 → fp32, int8 → int32
+# Accumulation dtype for T.gemm: fp16 鈫?fp32, int8 鈫?int32
 _GEMM_ACCUM_DTYPE: dict[torch.dtype, torch.dtype] = {
     torch.float16: torch.float32,
     torch.int8:    torch.int32,
@@ -856,7 +856,7 @@ def add_tilelang_gemm_choices(
     # T.gemm accumulates in accum_dtype (fp32 for fp16 input) and writes fp32
     # to the output buffer.  Override the layout so inductor allocates the
     # correctly-typed buffer instead of the input dtype (fp16), which would
-    # cause the fp32 bits to be reinterpreted as fp16 → garbage results.
+    # cause the fp32 bits to be reinterpreted as fp16 鈫?garbage results.
     #
     # Must use FixedLayout (not FlexibleLayout): when the mm result is read by
     # a fused epilogue (relu/sigmoid/scale), the scheduler calls make_indexer()
@@ -1567,6 +1567,7 @@ class TileLangKernel(NPUIndexTritonKernel):
     def _reduction_symbol_replacements(
         self,
         index: sympy.Expr,
+        reduction_index: str = "_tl_i",
     ) -> dict[sympy.Symbol, str]:
         r_symbols = [
             symbol for symbol in index.free_symbols
@@ -1612,11 +1613,11 @@ class TileLangKernel(NPUIndexTritonKernel):
                 ) from exc
 
             if i == 0:
-                replacements[symbol] = f"(_tl_i % {extent})"
+                replacements[symbol] = f"({reduction_index} % {extent})"
             elif i == len(ordered) - 1:
-                replacements[symbol] = f"(_tl_i // {factor})"
+                replacements[symbol] = f"({reduction_index} // {factor})"
             else:
-                replacements[symbol] = f"((_tl_i // {factor}) % {extent})"
+                replacements[symbol] = f"(({reduction_index} // {factor}) % {extent})"
             factor *= extent
         return replacements
 
@@ -1699,7 +1700,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         for symbol in self._reduction_matrix_symbols(index):
             name = getattr(symbol, "name", str(symbol))
             if name.startswith("x"):
-                dims.append("_XBLOCK")
+                dims.append("_XBLOCK_SUB")
             elif _is_reduction_symbol_name(name):
                 dims.append("_RBLOCK")
             else:
@@ -1708,7 +1709,7 @@ class TileLangKernel(NPUIndexTritonKernel):
 
     def _reduction_scalar_local_shape_from_index(self, index: sympy.Expr) -> str:
         dims = [
-            "_XBLOCK" if getattr(symbol, "name", str(symbol)).startswith("x") else "1"
+            "_XBLOCK_SUB" if getattr(symbol, "name", str(symbol)).startswith("x") else "1"
             for symbol in self._reduction_matrix_symbols(index)
         ]
         return f"({', '.join(dims)},)"
@@ -1762,11 +1763,11 @@ class TileLangKernel(NPUIndexTritonKernel):
                     f"pointwise axes; {symbol} has length {extent}"
                 ) from exc
             if i == 0:
-                replacements[symbol] = f"(cid % {extent_int})"
+                replacements[symbol] = f"({pointwise_index} % {extent_int})"
             elif i == len(ordered) - 1:
-                replacements[symbol] = f"(cid // {factor})"
+                replacements[symbol] = f"({pointwise_index} // {factor})"
             else:
-                replacements[symbol] = f"((cid // {factor}) % {extent_int})"
+                replacements[symbol] = f"(({pointwise_index} // {factor}) % {extent_int})"
             factor *= extent_int
         return replacements
 
@@ -1789,16 +1790,22 @@ class TileLangKernel(NPUIndexTritonKernel):
                 return representative_index
         return index
 
-    def _reduction_matrix_start_index_tuple(self, index: sympy.Expr) -> str:
+    def _reduction_matrix_start_index_tuple(
+        self,
+        index: sympy.Expr,
+        pointwise_index: str = "cid * _XBLOCK",
+        reduction_index: str = "0",
+    ) -> str:
         reduction_numel = self.numels.get("r", sympy.S.One)
         if _is_dense_reduction_matrix_index(index, reduction_numel):
-            return "cid * _XBLOCK, 0"
+            return f"{pointwise_index}, {reduction_index}"
 
         replacements = {}
-        replacements.update(self._pointwise_symbol_replacements(index, "cid * _XBLOCK"))
+        replacements.update(self._pointwise_symbol_replacements(index, pointwise_index))
+        replacements.update(self._reduction_symbol_replacements(index, reduction_index))
         for symbol in index.free_symbols:
             if _is_reduction_symbol_name(getattr(symbol, "name", str(symbol))):
-                replacements[symbol] = "0"
+                replacements.setdefault(symbol, reduction_index)
         symbols = self._index_symbols_by_stride(index)
         parts = [
             _tilelang_index_expr(symbol, symbol_replacements=replacements)
@@ -1812,6 +1819,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         var: str,
         loc: str,
         copy_len: str = "_XBLOCK",
+        x_base: str = "cid * _XBLOCK",
         r_base: str = "0",
         copy_r: str = "_RBLOCK",
     ) -> None:
@@ -1819,13 +1827,15 @@ class TileLangKernel(NPUIndexTritonKernel):
         reduction_numel = self.numels.get("r", sympy.S.One)
         if _is_dense_reduction_matrix_index(index, reduction_numel):
             code.writeline(
-                f"T.copy({var}[cid * _XBLOCK:cid * _XBLOCK + {copy_len}, "
+                f"T.copy({var}[{x_base}:{x_base} + {copy_len}, "
                 f"{r_base}:{r_base} + {copy_r}], "
                 f"{loc}[0:{copy_len}, 0:{copy_r}])"
             )
             return
         code.writeline(
-            f"T.copy({var}[{self._reduction_matrix_start_index_tuple(index)}], {loc})"
+            f"T.copy({var}["
+            f"{self._reduction_matrix_start_index_tuple(index, x_base, r_base)}], "
+            f"{loc})"
         )
 
     def _emit_reduction_matrix_store(
@@ -1834,6 +1844,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         var: str,
         loc: str,
         copy_len: str = "_XBLOCK",
+        x_base: str = "cid * _XBLOCK",
         r_base: str = "0",
         copy_r: str = "_RBLOCK",
     ) -> None:
@@ -1849,12 +1860,13 @@ class TileLangKernel(NPUIndexTritonKernel):
         if _is_dense_reduction_matrix_index(index, reduction_numel):
             code.writeline(
                 f"T.copy({loc}[0:{copy_len}, 0:{copy_r}], "
-                f"{var}[cid * _XBLOCK:cid * _XBLOCK + {copy_len}, "
+                f"{var}[{x_base}:{x_base} + {copy_len}, "
                 f"{r_base}:{r_base} + {copy_r}])"
             )
             return
         code.writeline(
-            f"T.copy({loc}, {var}[{self._reduction_matrix_start_index_tuple(index)}])"
+            f"T.copy({loc}, {var}["
+            f"{self._reduction_matrix_start_index_tuple(index, x_base, r_base)}])"
         )
 
     def _is_tensor_output_loc(
@@ -2145,6 +2157,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         code.writeline("")
         code.writeline("_RBLOCK = R0BLOCK")
         code.writeline("_XBLOCK = X0BLOCK")
+        code.writeline("_XBLOCK_SUB = X0BLOCK_SUB")
         matrix_index = self._representative_reduction_matrix_index()
         matrix_local_shape = (
             self._reduction_matrix_local_shape_from_index(matrix_index)
@@ -2185,7 +2198,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                             self._tl_input_indices.get(loc, sympy.S.Zero)
                         )
                     elif kind == "row_broadcast":
-                        shape = "(_XBLOCK, 1)"
+                        shape = "(_XBLOCK_SUB, 1)"
                     else:
                         shape = "(1, _RBLOCK)"
                     code.writeline(
@@ -2216,198 +2229,206 @@ class TileLangKernel(NPUIndexTritonKernel):
                     buffer_shapes[loc] = scalar_reduce_shape
                 code.writeline("")
 
-                code.writeline("_remain_X = T.min(_XBLOCK, _xnumel - cid * _XBLOCK)")
-                code.writeline("")
-
-                for _, (var, loc, _) in self._tl_inputs.items():
-                    kind = self._reduction_input_kind(loc)
-                    if kind == "scalar":
-                        code.writeline(f"T.copy({var}[0], {loc}_brc_src)")
-                        code.writeline(f"T.vbrc({loc}_brc_src, {loc})")
-                    elif kind == "row_broadcast":
-                        code.writeline(
-                            f"T.copy({var}[cid * _XBLOCK:cid * _XBLOCK + _remain_X, 0:1], "
-                            f"{loc}[0:_remain_X, 0:1])"
-                        )
-                code.writeline("")
-
-                def emit_r_tile_loads() -> None:
+                code.writeline("_tl_outer_remain = T.min(_XBLOCK, _xnumel - cid * _XBLOCK)")
+                code.writeline("for _tl_block in T.serial(T.ceildiv(_tl_outer_remain, _XBLOCK_SUB)):")
+                with code.indent():
+                    code.writeline("_tl_base = cid * _XBLOCK + _tl_block * _XBLOCK_SUB")
+                    code.writeline(
+                        "_remain_X = T.min("
+                        "_XBLOCK_SUB, "
+                        "T.min(_XBLOCK - _tl_block * _XBLOCK_SUB, _xnumel - _tl_base)"
+                        ")"
+                    )
+                    code.writeline("")
                     for _, (var, loc, _) in self._tl_inputs.items():
                         kind = self._reduction_input_kind(loc)
-                        if kind == "col_vector":
+                        if kind == "scalar":
+                            code.writeline(f"T.copy({var}[0], {loc}_brc_src)")
+                            code.writeline(f"T.vbrc({loc}_brc_src, {loc})")
+                        elif kind == "row_broadcast":
                             code.writeline(
-                                f"T.copy({var}[0, _r_base:_r_base + _remain_R], "
-                                f"{loc}[0, 0:_remain_R])"
+                                f"T.copy({var}[_tl_base:_tl_base + _remain_X, 0:1], "
+                                f"{loc}[0:_remain_X, 0:1])"
                             )
+                    code.writeline("")
+    
+                    def emit_r_tile_loads() -> None:
+                        for _, (var, loc, _) in self._tl_inputs.items():
+                            kind = self._reduction_input_kind(loc)
+                            if kind == "col_vector":
+                                code.writeline(
+                                    f"T.copy({var}[0, _r_base:_r_base + _remain_R], "
+                                    f"{loc}[0, 0:_remain_R])"
+                                )
                         elif kind == "matrix":
                             self._emit_reduction_matrix_load(
-                                code, var, loc, "_remain_X", "_r_base", "_remain_R"
+                                code, var, loc, "_remain_X", "_tl_base", "_r_base", "_remain_R"
                             )
-
-                for out_loc, (result_var, dtype) in self._reduction_outputs.items():
-                    reduction_type, value, _ = self._reduction_vars[str(result_var)]
-
-                    def emit_reduction_pass(clear: bool) -> None:
-                        emit_r_tile_loads()
-
-                        reduce_input = f"_{result_var}_reduce_in"
-                        ops_list: list[tuple] = []
-
-                        src = _build_vec_ops(
-                            value,
-                            reduce_input,
-                            ops_list,
-                            self._var_bufs,
-                            self._var_ops,
-                            self._var_consts,
-                            {},
-                        )
-
-                        if ops_list:
-                            last_op, last_operands, _ = ops_list[-1]
-                            if (
-                                last_op == "exp"
-                                and len(last_operands) == 1
-                                and isinstance(last_operands[0], str)
-                                and last_operands[0] not in input_locs
-                                and last_operands[0] not in {
-                                    loc for _, loc, _ in self._tl_outputs.values()
-                                }
-                                and last_operands[0] not in self._reduction_outputs
-                            ):
-                                reduce_input = last_operands[0]
-                            elif reduce_input not in already_allocated:
-                                code.writeline(
-                                    f"{reduce_input} = T.alloc_shared({matrix_local_shape}, "
-                                    f"'{tilelang_dtype(dtype)}')"
-                                )
-                                already_allocated.add(reduce_input)
-                                buffer_shapes[reduce_input] = matrix_local_shape
-                            ops_list[-1] = (last_op, last_operands, reduce_input)
-
-                        self._emit_vec_ops_with_lifetime_reuse(
-                            code,
-                            ops_list,
-                            matrix_local_shape,
-                            dtype,
-                            scalar_cache,
-                            already_allocated,
-                            buffer_shapes,
-                        )
-
-                        reduce_src = reduce_input if ops_list else src
-                        code.writeline(
-                            f"T.reduce({reduce_src}, {out_loc}, dims={reduce_dims}, "
-                            f"reduce_mode='{reduction_type}', clear={clear!r}, "
-                            "size=[_XBLOCK, _remain_R])"
-                        )
-
-                    code.writeline("_r_base = 0")
-                    code.writeline("_remain_R = T.min(_RBLOCK, _rnumel)")
-                    emit_reduction_pass(True)
-                    code.writeline("for _tl_r in T.serial(1, T.ceildiv(_rnumel, _RBLOCK)):")
-                    with code.indent():
-                        code.writeline("_r_base = _tl_r * _RBLOCK")
-                        code.writeline("_remain_R = T.min(_RBLOCK, _rnumel - _r_base)")
-                        emit_reduction_pass(False)
-                    code.writeline("")
-
-                if vector_epilogue_locs:
-                    code.writeline("for _tl_r in T.serial(T.ceildiv(_rnumel, _RBLOCK)):")
-                    with code.indent():
-                        code.writeline("_r_base = _tl_r * _RBLOCK")
-                        code.writeline("_remain_R = T.min(_RBLOCK, _rnumel - _r_base)")
-                        emit_r_tile_loads()
-
-                        for out_loc, (result_var, dtype) in self._output_vars.items():
-                            if out_loc not in vector_epilogue_locs:
-                                continue
-                            out_kind = self._reduction_output_extent(out_loc, tensor_arg_names)
+    
+                    for out_loc, (result_var, dtype) in self._reduction_outputs.items():
+                        reduction_type, value, _ = self._reduction_vars[str(result_var)]
+    
+                        def emit_reduction_pass(clear: bool) -> None:
+                            emit_r_tile_loads()
+    
+                            reduce_input = f"_{result_var}_reduce_in"
                             ops_list: list[tuple] = []
-
+    
                             src = _build_vec_ops(
-                                result_var,
-                                out_loc,
+                                value,
+                                reduce_input,
                                 ops_list,
                                 self._var_bufs,
                                 self._var_ops,
                                 self._var_consts,
                                 {},
                             )
-
-                            if not ops_list:
-                                if src != out_loc:
-                                    code.writeline(f"T.copy({src}, {out_loc})")
-                                continue
-
-                            last_op, last_operands, _ = ops_list[-1]
-                            ops_list[-1] = (last_op, last_operands, out_loc)
-
+    
+                            if ops_list:
+                                last_op, last_operands, _ = ops_list[-1]
+                                if (
+                                    last_op == "exp"
+                                    and len(last_operands) == 1
+                                    and isinstance(last_operands[0], str)
+                                    and last_operands[0] not in input_locs
+                                    and last_operands[0] not in {
+                                        loc for _, loc, _ in self._tl_outputs.values()
+                                    }
+                                    and last_operands[0] not in self._reduction_outputs
+                                ):
+                                    reduce_input = last_operands[0]
+                                elif reduce_input not in already_allocated:
+                                    code.writeline(
+                                        f"{reduce_input} = T.alloc_shared({matrix_local_shape}, "
+                                        f"'{tilelang_dtype(dtype)}')"
+                                    )
+                                    already_allocated.add(reduce_input)
+                                    buffer_shapes[reduce_input] = matrix_local_shape
+                                ops_list[-1] = (last_op, last_operands, reduce_input)
+    
                             self._emit_vec_ops_with_lifetime_reuse(
                                 code,
                                 ops_list,
-                                matrix_local_shape if out_kind == "matrix" else scalar_reduce_shape,
+                                matrix_local_shape,
                                 dtype,
                                 scalar_cache,
                                 already_allocated,
                                 buffer_shapes,
                             )
-
-                        for _, (var, loc, _) in self._tl_outputs.items():
-                            if var in tensor_arg_names and loc in vector_epilogue_locs:
-                                self._emit_reduction_matrix_store(
-                                    code, var, loc, "_remain_X", "_r_base", "_remain_R"
+    
+                            reduce_src = reduce_input if ops_list else src
+                        code.writeline(
+                            f"T.reduce({reduce_src}, {out_loc}, dims={reduce_dims}, "
+                            f"reduce_mode='{reduction_type}', clear={clear!r}, "
+                            "size=[_XBLOCK_SUB, _remain_R])"
+                        )
+    
+                        code.writeline("_r_base = 0")
+                        code.writeline("_remain_R = T.min(_RBLOCK, _rnumel)")
+                        emit_reduction_pass(True)
+                        code.writeline("for _tl_r in T.serial(1, T.ceildiv(_rnumel, _RBLOCK)):")
+                        with code.indent():
+                            code.writeline("_r_base = _tl_r * _RBLOCK")
+                            code.writeline("_remain_R = T.min(_RBLOCK, _rnumel - _r_base)")
+                            emit_reduction_pass(False)
+                        code.writeline("")
+    
+                    if vector_epilogue_locs:
+                        code.writeline("for _tl_r in T.serial(T.ceildiv(_rnumel, _RBLOCK)):")
+                        with code.indent():
+                            code.writeline("_r_base = _tl_r * _RBLOCK")
+                            code.writeline("_remain_R = T.min(_RBLOCK, _rnumel - _r_base)")
+                            emit_r_tile_loads()
+    
+                            for out_loc, (result_var, dtype) in self._output_vars.items():
+                                if out_loc not in vector_epilogue_locs:
+                                    continue
+                                out_kind = self._reduction_output_extent(out_loc, tensor_arg_names)
+                                ops_list: list[tuple] = []
+    
+                                src = _build_vec_ops(
+                                    result_var,
+                                    out_loc,
+                                    ops_list,
+                                    self._var_bufs,
+                                    self._var_ops,
+                                    self._var_consts,
+                                    {},
                                 )
+    
+                                if not ops_list:
+                                    if src != out_loc:
+                                        code.writeline(f"T.copy({src}, {out_loc})")
+                                    continue
+    
+                                last_op, last_operands, _ = ops_list[-1]
+                                ops_list[-1] = (last_op, last_operands, out_loc)
+    
+                                self._emit_vec_ops_with_lifetime_reuse(
+                                    code,
+                                    ops_list,
+                                    matrix_local_shape if out_kind == "matrix" else scalar_reduce_shape,
+                                    dtype,
+                                    scalar_cache,
+                                    already_allocated,
+                                    buffer_shapes,
+                                )
+    
+                            for _, (var, loc, _) in self._tl_outputs.items():
+                                if var in tensor_arg_names and loc in vector_epilogue_locs:
+                                    self._emit_reduction_matrix_store(
+                                        code, var, loc, "_remain_X", "_tl_base", "_r_base", "_remain_R"
+                                    )
+                        code.writeline("")
+    
+                    # ---- scalar epilogue: per-row outputs computed from reduction
+                    # results but with no reduction index in their output index
+                    # (e.g. mean = sum/N, or any f(reduction_result) per row).
+                    # These are in _output_vars but NOT in vector_epilogue_locs.
+                    scalar_epilogue_locs = {
+                        loc
+                        for loc in self._output_vars
+                        if loc not in self._reduction_outputs
+                        and loc not in vector_epilogue_locs
+                        and self._is_tensor_output_loc(loc, tensor_arg_names)
+                    }
+                    for out_loc in scalar_epilogue_locs:
+                        result_var, dtype = self._output_vars[out_loc]
+                        ops_list: list[tuple] = []
+                        src = _build_vec_ops(
+                            result_var,
+                            out_loc,
+                            ops_list,
+                            self._var_bufs,
+                            self._var_ops,
+                            self._var_consts,
+                        )
+                        if not ops_list:
+                            if src != out_loc:
+                                code.writeline(f"T.copy({src}, {out_loc})")
+                            continue
+                        last_op, last_operands, _ = ops_list[-1]
+                        ops_list[-1] = (last_op, last_operands, out_loc)
+                        self._emit_vec_ops_with_lifetime_reuse(
+                            code,
+                            ops_list,
+                            scalar_reduce_shape,
+                            dtype,
+                            scalar_cache,
+                            already_allocated,
+                            buffer_shapes,
+                        )
+    
                     code.writeline("")
-
-                # ---- scalar epilogue: per-row outputs computed from reduction
-                # results but with no reduction index in their output index
-                # (e.g. mean = sum/N, or any f(reduction_result) per row).
-                # These are in _output_vars but NOT in vector_epilogue_locs.
-                scalar_epilogue_locs = {
-                    loc
-                    for loc in self._output_vars
-                    if loc not in self._reduction_outputs
-                    and loc not in vector_epilogue_locs
-                    and self._is_tensor_output_loc(loc, tensor_arg_names)
-                }
-                for out_loc in scalar_epilogue_locs:
-                    result_var, dtype = self._output_vars[out_loc]
-                    ops_list: list[tuple] = []
-                    src = _build_vec_ops(
-                        result_var,
-                        out_loc,
-                        ops_list,
-                        self._var_bufs,
-                        self._var_ops,
-                        self._var_consts,
-                    )
-                    if not ops_list:
-                        if src != out_loc:
-                            code.writeline(f"T.copy({src}, {out_loc})")
-                        continue
-                    last_op, last_operands, _ = ops_list[-1]
-                    ops_list[-1] = (last_op, last_operands, out_loc)
-                    self._emit_vec_ops_with_lifetime_reuse(
-                        code,
-                        ops_list,
-                        "(1, 1)",
-                        dtype,
-                        scalar_cache,
-                        already_allocated,
-                        buffer_shapes,
-                    )
-
-                code.writeline("")
-                for _, (var, loc, _) in self._tl_outputs.items():
-                    if var not in tensor_arg_names:
-                        continue
-                    if loc in vector_epilogue_locs:
-                        continue
-                    code.writeline(
-                        f"T.copy({loc}[0:_remain_X, 0:1], "
-                        f"{var}[cid * _XBLOCK:cid * _XBLOCK + _remain_X, 0:1])"
-                    )
+                    for _, (var, loc, _) in self._tl_outputs.items():
+                        if var not in tensor_arg_names:
+                            continue
+                        if loc in vector_epilogue_locs:
+                            continue
+                        code.writeline(
+                            f"T.copy({loc}[0:_remain_X, 0:1], "
+                            f"{var}[_tl_base:_tl_base + _remain_X, 0:1])"
+                        )
 
         src = code.getvalue()
         print("====== TileLang reduction prim_func ======")
@@ -2432,7 +2453,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         _visited.add(var_name)
 
         if var_name not in self._var_ops:
-            return  # input buffer or constant — no op to check
+            return  # input buffer or constant 鈥?no op to check
 
         op_name, operands = self._var_ops[var_name]
 
@@ -2456,7 +2477,7 @@ class TileLangKernel(NPUIndexTritonKernel):
             _, supported = _BINARY_VEC_OPS["mul"]
             if dtype not in supported:
                 raise NotImplementedError(
-                    f"TileLang NPU: neg (→vmul×-1) does not support dtype {dtype}. "
+                    f"TileLang NPU: neg (鈫抳mul脳-1) does not support dtype {dtype}. "
                     f"Falling back to Triton."
                 )
 
@@ -2820,7 +2841,7 @@ class TileLangScheduling(NPUTritonScheduling):
         render  = getattr(ir_node, "make_kernel_render", None)
 
         if not isinstance(render, _TileLangGemmRender):
-            # Not a TileLang template — let the NPU Triton path handle it.
+            # Not a TileLang template 鈥?let the NPU Triton path handle it.
             return self._triton_scheduling.codegen_template(
                 template_node, epilogue_nodes, only_gen_src_code
             )
