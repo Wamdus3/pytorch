@@ -614,7 +614,7 @@ def _tilelang_xblock_configs(
         tile_generator = TileGenerator(
             [xnumel],
             ["x0"],
-            tiling_axis=[],
+            tiling_axis=[0] if not is_reduction else [],
             no_loop_axis=[],
             split_axis=[0],
             low_dims=[],
@@ -629,25 +629,29 @@ def _tilelang_xblock_configs(
 
     allowed = _tilelang_parse_xblock_candidate_filter()
     configs: list[dict[str, int]] = []
-    seen: set[int] = set()
+    seen: set[tuple[int, int]] = set()
     for cfg in tile_configs:
-        x0block = getattr(cfg, "kwargs", {}).get("X0BLOCK")
+        cfg_kwargs = getattr(cfg, "kwargs", {})
+        x0block = cfg_kwargs.get("X0BLOCK")
         if x0block is None:
             continue
         x0block = int(x0block)
+        x0block_sub = int(cfg_kwargs.get("X0BLOCK_SUB", x0block))
         if allowed is not None and x0block not in allowed:
             continue
-        if x0block in seen:
+        key = (x0block, x0block_sub)
+        if key in seen:
             continue
-        seen.add(x0block)
-        configs.append({"X0BLOCK": x0block})
+        seen.add(key)
+        configs.append({"X0BLOCK": x0block, "X0BLOCK_SUB": x0block_sub})
 
     fallback_hint = _DEFAULT_REDUCTION_XBLOCK if is_reduction else _DEFAULT_XBLOCK
     if allowed is None or fallback_hint in allowed:
-        if fallback_hint not in seen:
-            configs.append({"X0BLOCK": fallback_hint})
+        fallback_key = (fallback_hint, fallback_hint)
+        if fallback_key not in seen:
+            configs.append({"X0BLOCK": fallback_hint, "X0BLOCK_SUB": fallback_hint})
     if not configs:
-        configs.append({"X0BLOCK": fallback_hint})
+        configs.append({"X0BLOCK": fallback_hint, "X0BLOCK_SUB": fallback_hint})
     return configs
 
 _TILELANG_NPUIR_PASS_CONFIGS = {
@@ -1474,11 +1478,15 @@ class TileLangKernel(NPUIndexTritonKernel):
             return "cid"
         return f"((cid * _XBLOCK) // {self._static_value_var('B', factor)})"
 
-    def _pointwise_broadcast_lane_index(self, loc: str) -> str:
+    def _pointwise_broadcast_lane_index(
+        self,
+        loc: str,
+        pointwise_index: str = "(cid * _XBLOCK + _tl_i)",
+    ) -> str:
         factor = self._pointwise_broadcast_factor(loc)
         if factor is not None:
             factor_var = self._static_value_var("B", factor)
-            index = f"((cid * _XBLOCK + _tl_i) // {factor_var})"
+            index = f"({pointwise_index} // {factor_var})"
             if loc in self._tl_input_numels:
                 numel_var = self._static_value_var("B", self._tl_input_numels[loc])
                 index = f"({index} % {numel_var})"
@@ -1486,7 +1494,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         index = self._tl_input_indices.get(loc, sympy.S.Zero)
         return _tilelang_index_expr(
             index,
-            pointwise_index="(cid * _XBLOCK + _tl_i)",
+            pointwise_index=pointwise_index,
         )
 
     def _reduction_input_kind(self, loc: str) -> str:
@@ -1869,98 +1877,122 @@ class TileLangKernel(NPUIndexTritonKernel):
                     f"{argdef.name}: T.Tensor({shape}, '{tilelang_dtype(sig.dtype)}')"
                 )
 
+        def emit_pointwise_body(
+            code: IndentedBuffer,
+            vector_len: str,
+            base_index: str,
+            pointwise_index: str,
+        ) -> None:
+            # ---- allocate input buffers (L1/shared) ----
+            for _, (var, loc, dtype) in self._tl_inputs.items():
+                kind = self._pointwise_input_kind(loc)
+                if kind == "scalar":
+                    code.writeline(
+                        f"{loc}_brc_src = T.alloc_shared((1,), "
+                        f"'{tilelang_dtype(dtype)}')"
+                    )
+                code.writeline(
+                    f"{loc} = T.alloc_shared(({vector_len},), '{tilelang_dtype(dtype)}')"
+                )
+
+            # ---- allocate output buffers (fragment) ----
+            input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
+            for _, (var, loc, dtype) in self._tl_outputs.items():
+                if loc not in input_locs:
+                    code.writeline(
+                        f"{loc} = T.alloc_shared(({vector_len},), '{tilelang_dtype(dtype)}')"
+                    )
+            code.writeline("")
+
+            # ---- T.copy: GM -> L1 for every input ----
+            for _, (var, loc, _) in self._tl_inputs.items():
+                kind = self._pointwise_input_kind(loc)
+                if kind == "scalar":
+                    code.writeline(f"T.copy({var}[0], {loc}_brc_src)")
+                    code.writeline(f"T.vbrc({loc}_brc_src, {loc})")
+                elif kind == "broadcast":
+                    load_index = self._pointwise_broadcast_lane_index(
+                        loc,
+                        pointwise_index=pointwise_index,
+                    )
+                    code.writeline(f"for _tl_i in T.Parallel({vector_len}):")
+                    with code.indent():
+                        code.writeline(f"{loc}[_tl_i] = {var}[{load_index}]")
+                else:
+                    code.writeline(f"T.copy({var}[{base_index}], {loc})")
+            code.writeline("")
+
+            # ---- emit NPU vector ops ----
+            already_allocated = (
+                {loc for _, loc, _ in self._tl_inputs.values()}
+                | {loc for _, loc, _ in self._tl_outputs.values()}
+            )
+            scalar_cache: dict[tuple[str, str], str] = {}
+            for out_loc, (result_var, dtype) in self._output_vars.items():
+                ops_list: list[tuple] = []
+                _build_vec_ops(
+                    result_var, out_loc, ops_list,
+                    self._var_bufs, self._var_ops, self._var_consts,
+                )
+
+                if not ops_list:
+                    # result_var is a direct input buffer reference (identity)
+                    src = self._var_bufs.get(str(result_var), str(result_var))
+                    if src != out_loc:
+                        code.writeline(f"T.copy({src}, {out_loc})")
+                    continue
+
+                # Fix the last op to write directly into out_loc
+                last_op, last_operands, _ = ops_list[-1]
+                ops_list[-1] = (last_op, last_operands, out_loc)
+
+                self._emit_vec_ops_with_lifetime_reuse(
+                    code,
+                    ops_list,
+                    f"({vector_len},)",
+                    dtype,
+                    scalar_cache,
+                    already_allocated,
+                )
+
+            code.writeline("")
+
+            # ---- T.copy: fragment -> GM for every output ----
+            for _, (var, loc, _) in self._tl_outputs.items():
+                code.writeline(f"T.copy({loc}, {var}[{base_index}])")
+
+        def emit_pointwise_prim_func(code: IndentedBuffer) -> None:
+            code.writeline("@T.prim_func")
+            code.writeline(f"def {prim_fn_name}(")
+            with code.indent():
+                for i, part in enumerate(prim_sig_parts):
+                    code.writeline(f"{part}{',' if i < len(prim_sig_parts) - 1 else ''}")
+            code.writeline("):")
+
+            with code.indent():
+                code.writeline(
+                    "with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):"
+                )
+                with code.indent():
+                    code.writeline(
+                        "for _tl_block in T.serial(T.ceildiv(_XBLOCK, _XBLOCK_SUB)):"
+                    )
+                    with code.indent():
+                        emit_pointwise_body(
+                            code,
+                            "_XBLOCK_SUB",
+                            "cid * _XBLOCK + _tl_block * _XBLOCK_SUB",
+                            "(cid * _XBLOCK + _tl_block * _XBLOCK_SUB + _tl_i)",
+                        )
+
         code = IndentedBuffer()
         code.writeline("import tilelang.language as T")
         code.writeline("import math as _math")
         code.writeline("")
         code.writeline("_XBLOCK = X0BLOCK")
+        code.writeline("_XBLOCK_SUB = X0BLOCK_SUB")
         code.writeline("")
-        code.writeline("@T.prim_func")
-        code.writeline(f"def {prim_fn_name}(")
-        with code.indent():
-            for i, part in enumerate(prim_sig_parts):
-                code.writeline(f"{part}{',' if i < len(prim_sig_parts) - 1 else ''}")
-        code.writeline("):")
-
-        with code.indent():
-            code.writeline(
-                "with T.Kernel(T.ceildiv(_xnumel, _XBLOCK), is_npu=True) as (cid, _):"
-            )
-            with code.indent():
-                # ---- allocate input buffers (L1/shared) ----
-                for _, (var, loc, dtype) in self._tl_inputs.items():
-                    kind = self._pointwise_input_kind(loc)
-                    if kind == "scalar":
-                        code.writeline(
-                            f"{loc}_brc_src = T.alloc_shared((1,), "
-                            f"'{tilelang_dtype(dtype)}')"
-                        )
-                    code.writeline(
-                        f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
-                    )
-
-                # ---- allocate output buffers (fragment) ----
-                input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
-                for _, (var, loc, dtype) in self._tl_outputs.items():
-                    if loc not in input_locs:
-                        code.writeline(
-                            f"{loc} = T.alloc_shared((_XBLOCK,), '{tilelang_dtype(dtype)}')"
-                        )
-                code.writeline("")
-
-                # ---- T.copy: GM -> L1 for every input ----
-                for _, (var, loc, _) in self._tl_inputs.items():
-                    kind = self._pointwise_input_kind(loc)
-                    if kind == "scalar":
-                        code.writeline(f"T.copy({var}[0], {loc}_brc_src)")
-                        code.writeline(f"T.vbrc({loc}_brc_src, {loc})")
-                    elif kind == "broadcast":
-                        load_index = self._pointwise_broadcast_lane_index(loc)
-                        code.writeline("for _tl_i in T.Parallel(_XBLOCK):")
-                        with code.indent():
-                            code.writeline(f"{loc}[_tl_i] = {var}[{load_index}]")
-                    else:
-                        code.writeline(f"T.copy({var}[cid * _XBLOCK], {loc})")
-                code.writeline("")
-
-                # ---- emit NPU vector ops ----
-                already_allocated = (
-                    {loc for _, loc, _ in self._tl_inputs.values()}
-                    | {loc for _, loc, _ in self._tl_outputs.values()}
-                )
-                scalar_cache: dict[tuple[str, str], str] = {}
-                for out_loc, (result_var, dtype) in self._output_vars.items():
-                    ops_list: list[tuple] = []
-                    _build_vec_ops(
-                        result_var, out_loc, ops_list,
-                        self._var_bufs, self._var_ops, self._var_consts,
-                    )
-
-                    if not ops_list:
-                        # result_var is a direct input buffer reference (identity)
-                        src = self._var_bufs.get(str(result_var), str(result_var))
-                        if src != out_loc:
-                            code.writeline(f"T.copy({src}, {out_loc})")
-                        continue
-
-                    # Fix the last op to write directly into out_loc
-                    last_op, last_operands, _ = ops_list[-1]
-                    ops_list[-1] = (last_op, last_operands, out_loc)
-
-                    self._emit_vec_ops_with_lifetime_reuse(
-                        code,
-                        ops_list,
-                        "(_XBLOCK,)",
-                        dtype,
-                        scalar_cache,
-                        already_allocated,
-                    )
-
-                code.writeline("")
-
-                # ---- T.copy: fragment -> GM for every output ----
-                for _, (var, loc, _) in self._tl_outputs.items():
-                    code.writeline(f"T.copy({loc}, {var}[cid * _XBLOCK])")
+        emit_pointwise_prim_func(code)
 
         src = code.getvalue()
         print("====== TileLang prim_func ======")
@@ -2957,7 +2989,7 @@ class TileLangScheduling(NPUTritonScheduling):
         static_axis_args = kernel.tilelang_static_axis_args()
         static_axis_arg_names = [name.lstrip("_") for name, _ in static_axis_args]
         shape_factory_arg_names = numel_arg_names + static_axis_arg_names
-        factory_arg_names = shape_factory_arg_names + ["X0BLOCK"]
+        factory_arg_names = shape_factory_arg_names + ["X0BLOCK", "X0BLOCK_SUB"]
         outer_arg_list   = tensor_call_args + numel_arg_names
 
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
@@ -3053,8 +3085,13 @@ class TileLangScheduling(NPUTritonScheduling):
                     f"buffer_count={buffer_count!r})"
                 )
                 code.writeline(
-                    "_tilelang_fallback_hint = ("
+                    "_tilelang_fallback_x0block = ("
                     f"_tilelang_configs[0]['X0BLOCK'] "
+                    f"if _tilelang_configs else {fallback_xblock_hint!r})"
+                )
+                code.writeline(
+                    "_tilelang_fallback_x0block_sub = ("
+                    "_tilelang_configs[0].get('X0BLOCK_SUB', _tilelang_fallback_x0block) "
                     f"if _tilelang_configs else {fallback_xblock_hint!r})"
                 )
                 code.writeline(
@@ -3064,10 +3101,10 @@ class TileLangScheduling(NPUTritonScheduling):
                     code.writeline("try:")
                     with code.indent():
                         code.writeline("from tilelang.autotuner import AutoTuner as _TileLangAutoTuner")
-                        code.writeline("def _autotune_factory(X0BLOCK):")
+                        code.writeline("def _autotune_factory(X0BLOCK, X0BLOCK_SUB):")
                         with code.indent():
                             autotune_factory_args = ", ".join(
-                                [arg for arg in [shape_factory_call, "X0BLOCK"] if arg]
+                                [arg for arg in [shape_factory_call, "X0BLOCK", "X0BLOCK_SUB"] if arg]
                             )
                             code.writeline(f"return {factory_fn}({autotune_factory_args})")
                         code.writeline("def _tilelang_supply(_params, config=None):")
@@ -3115,10 +3152,20 @@ class TileLangScheduling(NPUTritonScheduling):
                         )
                         code.writeline(
                             "_tilelang_selected_hint = _tilelang_selected_config.get("
-                            "'X0BLOCK', _tilelang_fallback_hint)"
+                            "'X0BLOCK', _tilelang_fallback_x0block)"
+                        )
+                        code.writeline(
+                            "_tilelang_selected_sub = _tilelang_selected_config.get("
+                            "'X0BLOCK_SUB', _tilelang_fallback_x0block_sub)"
                         )
                         selected_factory_args = ", ".join(
-                            [arg for arg in [shape_factory_call, "_tilelang_selected_hint"] if arg]
+                            [
+                                arg for arg in [
+                                    shape_factory_call,
+                                    "_tilelang_selected_hint",
+                                    "_tilelang_selected_sub",
+                                ] if arg
+                            ]
                         )
                         code.writeline(f"_compiled_kernel = {import_alias}.compile(")
                         with code.indent():
@@ -3141,7 +3188,13 @@ class TileLangScheduling(NPUTritonScheduling):
                 code.writeline("if _compiled_kernel is None:")
                 with code.indent():
                     fallback_factory_args = ", ".join(
-                        [arg for arg in [shape_factory_call, "_tilelang_fallback_hint"] if arg]
+                        [
+                            arg for arg in [
+                                shape_factory_call,
+                                "_tilelang_fallback_x0block",
+                                "_tilelang_fallback_x0block_sub",
+                            ] if arg
+                        ]
                     )
                     code.writeline(f"_compiled_kernel = {import_alias}.compile(")
                     with code.indent():
