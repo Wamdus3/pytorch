@@ -1722,6 +1722,18 @@ class TileLangKernel(NPUIndexTritonKernel):
         ]
         return f"[{', '.join(dims)}]"
 
+    def _reduction_matrix_reduce_size_from_index(self, index: sympy.Expr) -> str:
+        sizes: list[str] = []
+        for symbol in self._reduction_matrix_symbols(index):
+            name = getattr(symbol, "name", str(symbol))
+            if name.startswith("x"):
+                sizes.append("_XBLOCK_SUB")
+            elif _is_reduction_symbol_name(name):
+                sizes.append("_remain_R")
+            else:
+                sizes.append(self._reduction_matrix_dim_expr(symbol, index))
+        return f"[{', '.join(sizes)}]"
+
     def _representative_reduction_matrix_index(self) -> Optional[sympy.Expr]:
         for loc in self._tl_reduction_input_locs:
             index = self._tl_input_indices.get(loc, sympy.S.Zero)
@@ -2171,6 +2183,10 @@ class TileLangKernel(NPUIndexTritonKernel):
             self._reduction_matrix_reduce_dims_from_index(matrix_index)
             if matrix_index is not None else "[1]"
         )
+        reduce_size = (
+            self._reduction_matrix_reduce_size_from_index(matrix_index)
+            if matrix_index is not None else "[1, _remain_R]"
+        )
         code.writeline("")
         code.writeline("@T.prim_func")
         code.writeline(f"def {prim_fn_name}(")
@@ -2260,10 +2276,16 @@ class TileLangKernel(NPUIndexTritonKernel):
                                     f"T.copy({var}[0, _r_base:_r_base + _remain_R], "
                                     f"{loc}[0, 0:_remain_R])"
                                 )
-                        elif kind == "matrix":
-                            self._emit_reduction_matrix_load(
-                                code, var, loc, "_remain_X", "_tl_base", "_r_base", "_remain_R"
-                            )
+                            elif kind == "matrix":
+                                self._emit_reduction_matrix_load(
+                                    code,
+                                    var,
+                                    loc,
+                                    "_remain_X",
+                                    "_tl_base",
+                                    "_r_base",
+                                    "_remain_R",
+                                )
     
                     for out_loc, (result_var, dtype) in self._reduction_outputs.items():
                         reduction_type, value, _ = self._reduction_vars[str(result_var)]
@@ -2317,11 +2339,11 @@ class TileLangKernel(NPUIndexTritonKernel):
                             )
     
                             reduce_src = reduce_input if ops_list else src
-                        code.writeline(
-                            f"T.reduce({reduce_src}, {out_loc}, dims={reduce_dims}, "
-                            f"reduce_mode='{reduction_type}', clear={clear!r}, "
-                            "size=[_XBLOCK_SUB, _remain_R])"
-                        )
+                            code.writeline(
+                                f"T.reduce({reduce_src}, {out_loc}, dims={reduce_dims}, "
+                                f"reduce_mode='{reduction_type}', clear={clear!r}, "
+                                f"size={reduce_size})"
+                            )
     
                         code.writeline("_r_base = 0")
                         code.writeline("_remain_R = T.min(_RBLOCK, _rnumel)")
@@ -2679,10 +2701,10 @@ class TileLangKernel(NPUIndexTritonKernel):
         return var
 
     def should_use_persistent_reduction(self) -> bool:
-        # TileLang NPU codegen uses T.reduce on the full reduction dimension in one
-        # shot (_RBLOCK = _rnumel). The persistent path in inductor matches this:
-        # it only calls store_reduction() and never emits the extra store() calls
-        # that the non-persistent path generates and that confuse our codegen.
+        # TileLang NPU codegen owns the r-block loop around T.reduce. The
+        # persistent path in inductor matches this: it only calls
+        # store_reduction() and never emits the extra store() calls that the
+        # non-persistent path generates and that confuse our codegen.
         return True
 
     def should_use_cooperative_reduction(self) -> bool:
