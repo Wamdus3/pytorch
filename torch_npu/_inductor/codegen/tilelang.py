@@ -792,6 +792,40 @@ _TILELANG_NPUIR_PASS_CONFIGS = {
 }
 
 
+def _tilelang_npuir_compile_target() -> Optional[str]:
+    """Return the Inductor active NPU target arch, e.g. Ascend910_9362."""
+    try:
+        from torch_npu._inductor import config as npu_inductor_config
+
+        target = getattr(npu_inductor_config, "target", None)
+        arch = getattr(target, "arch", None)
+        if arch:
+            return str(arch)
+    except Exception:
+        pass
+
+    try:
+        from triton.runtime.driver import driver
+
+        target = driver.active.get_current_target()
+        arch = getattr(target, "arch", None)
+        if arch:
+            return str(arch)
+    except Exception:
+        return None
+    return None
+
+
+def _tilelang_npuir_pass_configs() -> dict[str, Any]:
+    configs = dict(_TILELANG_NPUIR_PASS_CONFIGS)
+    target = _tilelang_npuir_compile_target()
+    if target:
+        # TileLang JIT consumes this NPUIR-only key and lowers it to
+        # bishengir-compile --target=<target>; it must not enter TVM PassContext.
+        configs["npuir.target"] = target
+    return configs
+
+
 _SUPPORTED_REDUCTIONS = frozenset({"sum", "max", "min"})
 
 
@@ -2912,6 +2946,11 @@ class TileLangScheduling(NPUTritonScheduling):
                 f"_sys.path.insert(0, {tl_pkg_root!r})"
             )
         code.writeline(f"import tilelang as {import_alias}")
+        npuir_pass_configs_fn = f"_tilelang_npuir_pass_configs_{suffix}"
+        code.writeline(
+            "from torch_npu._inductor.codegen.tilelang import "
+            f"_tilelang_npuir_pass_configs as {npuir_pass_configs_fn}"
+        )
         code.writeline("")
 
         code.writeline(f"def {factory_fn}(M, N, K):")
@@ -2935,7 +2974,7 @@ class TileLangScheduling(NPUTritonScheduling):
                 with code.indent():
                     code.writeline(
                         f"{factory_fn}(_key[0], _key[1], _key[2]), target='npuir', "
-                        f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
+                        f"pass_configs={npuir_pass_configs_fn}()"
                     )
                 code.writeline(")")
             code.writeline(f"{cache_var}[_key](A, B, C)")
@@ -3308,13 +3347,15 @@ class TileLangScheduling(NPUTritonScheduling):
         autotune_rep_fn = f"_tilelang_autotune_rep_{suffix}"
         autotune_timeout_fn = f"_tilelang_autotune_timeout_{suffix}"
         xblock_configs_fn = f"_tilelang_xblock_configs_{suffix}"
+        npuir_pass_configs_fn = f"_tilelang_npuir_pass_configs_{suffix}"
         code.writeline(
             "from torch_npu._inductor.codegen.tilelang import "
             f"_tilelang_autotune_enabled as {autotune_enabled_fn}, "
             f"_tilelang_autotune_warmup as {autotune_warmup_fn}, "
             f"_tilelang_autotune_rep as {autotune_rep_fn}, "
             f"_tilelang_autotune_timeout as {autotune_timeout_fn}, "
-            f"_tilelang_xblock_configs as {xblock_configs_fn}"
+            f"_tilelang_xblock_configs as {xblock_configs_fn}, "
+            f"_tilelang_npuir_pass_configs as {npuir_pass_configs_fn}"
         )
         code.writeline("")
 
@@ -3447,7 +3488,7 @@ class TileLangScheduling(NPUTritonScheduling):
                         with code.indent():
                             code.writeline(
                                 f"out_idx={output_arg_indices!r}, target='npuir', "
-                                f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
+                                f"pass_configs={npuir_pass_configs_fn}()"
                             )
                         code.writeline(")")
                         code.writeline("_tilelang_tuner.set_profile_args(")
@@ -3494,7 +3535,7 @@ class TileLangScheduling(NPUTritonScheduling):
                         with code.indent():
                             code.writeline(
                                 f"{factory_fn}({selected_factory_args}), target='npuir', "
-                                f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
+                                f"pass_configs={npuir_pass_configs_fn}()"
                             )
                         code.writeline(")")
                         code.writeline(
@@ -3524,7 +3565,7 @@ class TileLangScheduling(NPUTritonScheduling):
                     with code.indent():
                         code.writeline(
                             f"{factory_fn}({fallback_factory_args}), target='npuir', "
-                            f"pass_configs={_TILELANG_NPUIR_PASS_CONFIGS!r}"
+                            f"pass_configs={npuir_pass_configs_fn}()"
                         )
                     code.writeline(")")
                 code.writeline(f"{cache_var}[_key] = _compiled_kernel")
