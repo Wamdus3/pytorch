@@ -47,7 +47,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import sympy
 import torch
@@ -2252,6 +2252,24 @@ class TileLangKernel(NPUIndexTritonKernel):
         vector_epilogue = self._has_vector_epilogue_output(tensor_arg_names)
         vector_epilogue_locs = self._valid_vector_epilogue_locs(tensor_arg_names)
 
+        def collect_input_locs(var, _visited: Optional[set[str]] = None) -> set[str]:
+            if _visited is None:
+                _visited = set()
+            var_name = str(var)
+            if var_name in _visited:
+                return set()
+            _visited.add(var_name)
+            if var_name in self._var_bufs:
+                return {self._var_bufs[var_name]}
+            if var_name not in self._var_ops:
+                return set()
+
+            _, operands = self._var_ops[var_name]
+            locs: set[str] = set()
+            for operand in operands:
+                locs.update(collect_input_locs(operand, _visited))
+            return locs
+
         prim_sig_parts: list[str] = []
         for argdef, sig in zip(argdefs, signature):
             if not isinstance(sig, TensorArg):
@@ -2366,6 +2384,113 @@ class TileLangKernel(NPUIndexTritonKernel):
                         )
                         already_allocated.add(loc)
                     buffer_shapes[loc] = scalar_reduce_shape
+
+                def infer_vec_op_shapes(
+                    ops_list: list[tuple],
+                    local_shape: str,
+                    initial_shapes: dict[str, str],
+                ) -> dict[str, str]:
+                    planned_shapes = dict(initial_shapes)
+                    output_shapes: dict[str, str] = {}
+
+                    def operand_shape(operand) -> Optional[str]:
+                        if not isinstance(operand, str):
+                            return None
+                        return planned_shapes.get(operand)
+
+                    for op_name, operands, logical_out_buf in ops_list:
+                        operand_shapes = [
+                            shape for shape in (
+                                operand_shape(operand) for operand in operands
+                            )
+                            if shape is not None
+                        ]
+                        if logical_out_buf in planned_shapes:
+                            shape = planned_shapes[logical_out_buf]
+                        elif op_name in _UNARY_VEC_OPS and operand_shapes:
+                            shape = operand_shapes[0]
+                        elif local_shape in operand_shapes:
+                            shape = local_shape
+                        elif operand_shapes:
+                            shape = operand_shapes[0]
+                        else:
+                            shape = local_shape
+                        planned_shapes[logical_out_buf] = shape
+                        output_shapes[logical_out_buf] = shape
+                    return output_shapes
+
+                def predeclare_vec_temps(
+                    ops_list: list[tuple],
+                    local_shape: str,
+                    dtype: torch.dtype,
+                ) -> None:
+                    for loc, shape in infer_vec_op_shapes(
+                        ops_list, local_shape, buffer_shapes
+                    ).items():
+                        if loc in already_allocated:
+                            continue
+                        code.writeline(
+                            f"{loc} = T.alloc_shared({shape}, "
+                            f"'{tilelang_dtype(dtype)}')"
+                        )
+                        already_allocated.add(loc)
+                        buffer_shapes[loc] = shape
+
+                for out_loc, (result_var, dtype) in self._reduction_outputs.items():
+                    _, value, _ = self._reduction_vars[str(result_var)]
+                    reduce_input = f"_{result_var}_reduce_in"
+                    ops_list: list[tuple] = []
+                    _build_vec_ops(
+                        value,
+                        reduce_input,
+                        ops_list,
+                        self._var_bufs,
+                        self._var_ops,
+                        self._var_consts,
+                        {},
+                    )
+                    if ops_list:
+                        last_op, last_operands, _ = ops_list[-1]
+                        if not (
+                            last_op == "exp"
+                            and len(last_operands) == 1
+                            and isinstance(last_operands[0], str)
+                            and last_operands[0] not in input_locs
+                            and last_operands[0] not in {
+                                loc for _, loc, _ in self._tl_outputs.values()
+                            }
+                            and last_operands[0] not in self._reduction_outputs
+                        ):
+                            ops_list[-1] = (last_op, last_operands, reduce_input)
+                    predeclare_vec_temps(ops_list, matrix_local_shape, dtype)
+
+                if vector_epilogue_locs:
+                    for out_loc, (result_var, dtype) in self._output_vars.items():
+                        if out_loc not in vector_epilogue_locs:
+                            continue
+                        out_kind = self._reduction_output_extent(
+                            out_loc, tensor_arg_names
+                        )
+                        ops_list: list[tuple] = []
+                        _build_vec_ops(
+                            result_var,
+                            out_loc,
+                            ops_list,
+                            self._var_bufs,
+                            self._var_ops,
+                            self._var_consts,
+                            {},
+                        )
+                        if ops_list:
+                            last_op, last_operands, _ = ops_list[-1]
+                            ops_list[-1] = (last_op, last_operands, out_loc)
+                        predeclare_vec_temps(
+                            ops_list,
+                            matrix_local_shape
+                            if out_kind == "matrix"
+                            else scalar_reduce_shape,
+                            dtype,
+                        )
                 code.writeline("")
 
                 code.writeline("_tl_outer_remain = T.min(_XBLOCK, _xnumel - cid * _XBLOCK)")
@@ -2391,8 +2516,10 @@ class TileLangKernel(NPUIndexTritonKernel):
                             )
                     code.writeline("")
     
-                    def emit_r_tile_loads() -> None:
+                    def emit_r_tile_loads(required_locs: set[str]) -> None:
                         for _, (var, loc, _) in self._tl_inputs.items():
+                            if loc not in required_locs:
+                                continue
                             kind = self._reduction_input_kind(loc)
                             if kind == "col_vector":
                                 code.writeline(
@@ -2412,12 +2539,12 @@ class TileLangKernel(NPUIndexTritonKernel):
     
                     for out_loc, (result_var, dtype) in self._reduction_outputs.items():
                         reduction_type, value, _ = self._reduction_vars[str(result_var)]
-    
+
                         def emit_reduction_pass(clear: bool) -> None:
-                            emit_r_tile_loads()
-    
                             reduce_input = f"_{result_var}_reduce_in"
                             ops_list: list[tuple] = []
+                            required_locs = collect_input_locs(value)
+                            emit_r_tile_loads(required_locs)
     
                             src = _build_vec_ops(
                                 value,
@@ -2484,13 +2611,34 @@ class TileLangKernel(NPUIndexTritonKernel):
     
                     if vector_epilogue_locs:
                         def emit_vector_epilogue_tile() -> None:
-                            emit_r_tile_loads()
-    
                             for out_loc, (result_var, dtype) in self._output_vars.items():
                                 if out_loc not in vector_epilogue_locs:
                                     continue
                                 out_kind = self._reduction_output_extent(out_loc, tensor_arg_names)
                                 ops_list: list[tuple] = []
+                                required_locs = collect_input_locs(result_var)
+                                loaded_locs: set[str] = set()
+
+                                def emit_epilogue_loads(locs: set[str]) -> None:
+                                    for loc in locs:
+                                        if loc in loaded_locs:
+                                            continue
+                                        emit_r_tile_loads({loc})
+                                        loaded_locs.add(loc)
+
+                                def emit_operand_loads(
+                                    operands: list[Any],
+                                    _out_buf: str,
+                                ) -> None:
+                                    emit_epilogue_loads({
+                                        operand
+                                        for operand in operands
+                                        if (
+                                            isinstance(operand, str)
+                                            and operand in input_locs
+                                            and operand in required_locs
+                                        )
+                                    })
     
                                 src = _build_vec_ops(
                                     result_var,
@@ -2503,6 +2651,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                                 )
     
                                 if not ops_list:
+                                    emit_epilogue_loads(required_locs)
                                     if src != out_loc:
                                         code.writeline(f"T.copy({src}, {out_loc})")
                                     continue
@@ -2518,6 +2667,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                                     scalar_cache,
                                     already_allocated,
                                     buffer_shapes,
+                                    before_op=emit_operand_loads,
                                 )
     
                             for _, (var, loc, _) in self._tl_outputs.items():
@@ -2684,6 +2834,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         scalar_cache: dict[tuple[str, str], str],
         already_allocated: set[str],
         buffer_shapes: Optional[dict[str, str]] = None,
+        before_op: Optional[Callable[[list[Any], str], None]] = None,
     ) -> None:
         """
         Emit a linearized vector-op list while reusing temporary TileLang buffers.
@@ -2763,10 +2914,28 @@ class TileLangKernel(NPUIndexTritonKernel):
             resolved_operands = [_resolve_buffer(operand) for operand in operands]
             shape = _result_shape(op_name, resolved_operands, logical_out_buf)
             out_buf = _allocate_buffer(logical_out_buf, shape)
+            if before_op is not None:
+                before_op(resolved_operands, out_buf)
+            emit_op_name = op_name
+            emit_operands = resolved_operands
+            if (
+                op_name == "truediv"
+                and dtype in {torch.float16, torch.float32}
+                and len(resolved_operands) == 2
+                and _is_scalar_literal_operand(resolved_operands[1])
+                and float(resolved_operands[1]) != 0.0
+            ):
+                emit_op_name = "mul"
+                emit_operands = [
+                    resolved_operands[0],
+                    1.0 / float(resolved_operands[1]),
+                ]
             materialized_operands = self._materialize_scalar_operands(
-                code, op_name, resolved_operands, dtype, scalar_cache
+                code, emit_op_name, emit_operands, dtype, scalar_cache
             )
-            code.writeline(self._emit_vec_op(op_name, materialized_operands, out_buf))
+            code.writeline(
+                self._emit_vec_op(emit_op_name, materialized_operands, out_buf)
+            )
 
             for operand in operands:
                 if not isinstance(operand, str):
