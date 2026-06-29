@@ -1,4 +1,4 @@
-﻿"""
+"""
 TileLang codegen backend for torch_npu inductor (Ascend NPU).
 
 Generates TileLang @T.prim_func kernels compiled via
@@ -108,7 +108,7 @@ def tilelang_dtype(dtype: torch.dtype) -> str:
 
 
 # ---------------------------------------------------------------------------
-# NPU vector op mappings  (op_name 鈫?(tilelang_fn, supported_dtypes))
+# NPU vector op mappings  (op_name -> (tilelang_fn, supported_dtypes))
 #
 # Dtype support sourced from tilelang-mlir-ascend/docs/Tilelang.language/
 # Only dtypes reachable through inductor (no uint16 / uint32 / float64 paths).
@@ -133,7 +133,7 @@ _BINARY_VEC_OPS: dict[str, tuple[str, frozenset]] = {
     "pow":         ("vpow", frozenset({torch.int32})),
     "bitwise_and": ("vand", frozenset({torch.int8, torch.int64,
                                        torch.float16, torch.float32, torch.bool})),
-    "bitwise_or":  ("vor",  frozenset()),   # uint16 only 鈥?not reachable via inductor
+    "bitwise_or":  ("vor",  frozenset()),   # uint16 only; not reachable via inductor
     "bitwise_xor": ("vxor", frozenset()),   # same
 }
 
@@ -155,7 +155,7 @@ _UNARY_VEC_OPS: dict[str, tuple[str, frozenset]] = {
     "tanh":    ("vtanh",    _FP),
 }
 
-# Union of all dtypes supported by at least one op 鈥?used as early gate in load().
+# Union of all dtypes supported by at least one op; used as early gate in load().
 _ANY_SUPPORTED_DTYPE: frozenset[torch.dtype] = frozenset().union(
     *[s for _, s in _BINARY_VEC_OPS.values()],
     *[s for _, s in _UNARY_VEC_OPS.values()],
@@ -818,11 +818,11 @@ def _tilelang_npuir_compile_target() -> Optional[str]:
 
 def _tilelang_npuir_pass_configs() -> dict[str, Any]:
     configs = dict(_TILELANG_NPUIR_PASS_CONFIGS)
-    target = _tilelang_npuir_compile_target()
-    if target:
-        # TileLang JIT consumes this NPUIR-only key and lowers it to
-        # bishengir-compile --target=<target>; it must not enter TVM PassContext.
-        configs["npuir.target"] = target
+    auto_multi_buffer = os.environ.get("TILELANG_NPUIR_ENABLE_AUTO_MULTI_BUFFER")
+    if auto_multi_buffer is not None:
+        configs["npuir.enable_auto_multi_buffer"] = auto_multi_buffer.lower() not in {
+            "0", "false", "no", "off"
+        }
     return configs
 
 
@@ -833,7 +833,7 @@ _SUPPORTED_REDUCTIONS = frozenset({"sum", "max", "min"})
 # Matmul (T.gemm) codegen
 # ---------------------------------------------------------------------------
 
-# Accumulation dtype for T.gemm: fp16 鈫?fp32, int8 鈫?int32
+# Accumulation dtype for T.gemm: fp16 -> fp32, int8 -> int32
 _GEMM_ACCUM_DTYPE: dict[torch.dtype, torch.dtype] = {
     torch.float16: torch.float32,
     torch.int8:    torch.int32,
@@ -974,7 +974,7 @@ def add_tilelang_gemm_choices(
     # T.gemm accumulates in accum_dtype (fp32 for fp16 input) and writes fp32
     # to the output buffer.  Override the layout so inductor allocates the
     # correctly-typed buffer instead of the input dtype (fp16), which would
-    # cause the fp32 bits to be reinterpreted as fp16 鈫?garbage results.
+    # cause the fp32 bits to be reinterpreted as fp16, producing garbage results.
     #
     # Must use FixedLayout (not FlexibleLayout): when the mm result is read by
     # a fused epilogue (relu/sigmoid/scale), the scheduler calls make_indexer()
@@ -2610,7 +2610,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         _visited.add(var_name)
 
         if var_name not in self._var_ops:
-            return  # input buffer or constant 鈥?no op to check
+            return  # input buffer or constant; no op to check
 
         op_name, operands = self._var_ops[var_name]
 
@@ -2634,7 +2634,7 @@ class TileLangKernel(NPUIndexTritonKernel):
             _, supported = _BINARY_VEC_OPS["mul"]
             if dtype not in supported:
                 raise NotImplementedError(
-                    f"TileLang NPU: neg (鈫抳mul脳-1) does not support dtype {dtype}. "
+                    f"TileLang NPU: neg (via vmul * -1) does not support dtype {dtype}. "
                     f"Falling back to Triton."
                 )
 
@@ -3003,7 +3003,7 @@ class TileLangScheduling(NPUTritonScheduling):
         render  = getattr(ir_node, "make_kernel_render", None)
 
         if not isinstance(render, _TileLangGemmRender):
-            # Not a TileLang template 鈥?let the NPU Triton path handle it.
+            # Not a TileLang template; let the NPU Triton path handle it.
             return self._triton_scheduling.codegen_template(
                 template_node, epilogue_nodes, only_gen_src_code
             )
@@ -3452,6 +3452,24 @@ class TileLangScheduling(NPUTritonScheduling):
                 with code.indent():
                     code.writeline("try:")
                     with code.indent():
+                        code.writeline("import os as _tilelang_os")
+                        code.writeline("import tempfile as _tilelang_tempfile")
+                        code.writeline(
+                            "_tilelang_cache_dir = _tilelang_os.path.abspath("
+                            "_tilelang_os.environ.get('TILELANG_CACHE_DIR') "
+                            "or _tilelang_os.path.join(_tilelang_tempfile.gettempdir(), "
+                            "'tilelang_cache'))"
+                        )
+                        code.writeline(
+                            "_tilelang_os.makedirs(_tilelang_cache_dir, exist_ok=True)"
+                        )
+                        code.writeline(
+                            "_tilelang_os.environ['TILELANG_CACHE_DIR'] = "
+                            "_tilelang_cache_dir"
+                        )
+                        code.writeline(
+                            "_tilelang_os.environ['TILELANG_BENCH_METHOD'] = 'npu'"
+                        )
                         code.writeline("from tilelang.autotuner import AutoTuner as _TileLangAutoTuner")
                         autotune_factory_params = ", ".join(tiling_arg_names)
                         code.writeline(f"def _autotune_factory({autotune_factory_params}):")
