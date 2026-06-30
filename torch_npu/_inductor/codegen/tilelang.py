@@ -279,6 +279,7 @@ class TileLangOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype(x, dtype: torch.dtype, src_dtype=None, use_compute_types=True):
+        _set_pending("to_dtype", [x], dtype)
         if dtype == torch.bool:
             return f"({x} != 0)"
         return f"T.cast({x}, '{tilelang_dtype(dtype)}')"
@@ -1107,6 +1108,7 @@ def _tilelang_expr_key(
     var_bufs: dict,
     var_ops: dict,
     var_consts: Optional[dict] = None,
+    var_dtypes: Optional[dict] = None,
     _memo: Optional[dict[str, tuple]] = None,
 ) -> tuple:
     """Build a stable key for reusing already materialized TileLang expressions."""
@@ -1125,8 +1127,9 @@ def _tilelang_expr_key(
         key = (
             "op",
             op_name,
+            var_dtypes.get(var_name) if var_dtypes else None,
             tuple(
-                _tilelang_expr_key(op, var_bufs, var_ops, var_consts, _memo)
+                _tilelang_expr_key(op, var_bufs, var_ops, var_consts, var_dtypes, _memo)
                 for op in operands
             ),
         )
@@ -1136,6 +1139,84 @@ def _tilelang_expr_key(
     return key
 
 
+def _vec_op_parts(op_record: tuple):
+    if len(op_record) == 4:
+        return op_record
+    op_name, operands, out_buf = op_record
+    return op_name, operands, out_buf, None
+
+
+def _vec_op_with_out(op_record: tuple, out_buf: str) -> tuple:
+    op_name, operands, _, dtype = _vec_op_parts(op_record)
+    return op_name, operands, out_buf, dtype
+
+
+def _vec_op_dtype(op_record: tuple, default_dtype: torch.dtype) -> torch.dtype:
+    return _vec_op_parts(op_record)[3] or default_dtype
+
+
+def _finalize_vec_ops_output(
+    ops_list: list[tuple],
+    out_buf: str,
+    out_dtype: torch.dtype,
+) -> None:
+    if not ops_list:
+        return
+    op_name, _, logical_out_buf, op_dtype = _vec_op_parts(ops_list[-1])
+    op_dtype = op_dtype or out_dtype
+    if op_name == "copy" or op_dtype == out_dtype:
+        ops_list[-1] = _vec_op_with_out(ops_list[-1], out_buf)
+        return
+
+    copy_src = logical_out_buf
+    if copy_src == out_buf:
+        copy_src = f"{out_buf}_cast_src"
+        ops_list[-1] = _vec_op_with_out(ops_list[-1], copy_src)
+    ops_list.append(("copy", [copy_src], out_buf, out_dtype))
+
+
+def _delay_input_copy_ops(
+    ops_list: list[tuple],
+    input_locs: set[str],
+) -> list[tuple]:
+    """Move input dtype-copy ops to immediately before their first use."""
+    if not ops_list:
+        return ops_list
+
+    def is_delayable_input_copy(op_record: tuple) -> bool:
+        op_name, operands, out_buf, _ = _vec_op_parts(op_record)
+        return (
+            op_name == "copy"
+            and len(operands) == 1
+            and isinstance(operands[0], str)
+            and operands[0] in input_locs
+            and isinstance(out_buf, str)
+        )
+
+    reordered: list[tuple] = []
+    pending: dict[str, tuple] = {}
+
+    def flush_needed_copies(operands: list[Any]) -> None:
+        for operand in operands:
+            if isinstance(operand, str) and operand in pending:
+                reordered.append(pending.pop(operand))
+
+    for op_record in ops_list:
+        _, operands, out_buf, _ = _vec_op_parts(op_record)
+        flush_needed_copies(operands)
+
+        if is_delayable_input_copy(op_record):
+            pending[out_buf] = op_record
+            continue
+
+        if isinstance(out_buf, str) and out_buf in pending:
+            pending.pop(out_buf)
+        reordered.append(op_record)
+
+    reordered.extend(pending.values())
+    return reordered
+
+
 def _build_vec_ops(
     var,
     target_buf: str,
@@ -1143,8 +1224,10 @@ def _build_vec_ops(
     var_bufs: dict,
     var_ops: dict,
     var_consts: Optional[dict] = None,
+    var_dtypes: Optional[dict] = None,
     reusable_expr_bufs: Optional[dict[tuple, str]] = None,
     _visited: Optional[set] = None,
+    reusable_expr_predicate: Optional[Callable[[str], bool]] = None,
 ) -> str:
     """
     Recursively traverse the op graph rooted at `var` and append
@@ -1173,8 +1256,16 @@ def _build_vec_ops(
 
     # Computed var
     if var_name in var_ops:
-        if reusable_expr_bufs is not None:
-            expr_key = _tilelang_expr_key(var, var_bufs, var_ops, var_consts)
+        cacheable_expr = (
+            reusable_expr_bufs is not None
+            and (
+                reusable_expr_predicate is None
+                or reusable_expr_predicate(var_name)
+            )
+        )
+        expr_key = None
+        if cacheable_expr:
+            expr_key = _tilelang_expr_key(var, var_bufs, var_ops, var_consts, var_dtypes)
             if expr_key in reusable_expr_bufs:
                 return reusable_expr_bufs[expr_key]
 
@@ -1183,6 +1274,51 @@ def _build_vec_ops(
 
         _visited.add(var_name)
         op_name, operands = var_ops[var_name]
+        var_dtypes = var_dtypes or {}
+
+        if op_name == "to_dtype":
+            if len(operands) != 1:
+                raise RuntimeError("assert TileLang to_dtype expects one operand")
+            op = operands[0]
+            op_str = str(op)
+            if op_str in var_bufs:
+                src = var_bufs[op_str]
+            elif var_consts and op_str in var_consts:
+                try:
+                    src = float(var_consts[op_str])
+                except (ValueError, TypeError):
+                    src = var_consts[op_str]
+            elif op_str in var_ops:
+                inter_buf = f"_{op_str}_frag"
+                src = _build_vec_ops(
+                    op,
+                    inter_buf,
+                    ops_list,
+                    var_bufs,
+                    var_ops,
+                    var_consts,
+                    var_dtypes,
+                    reusable_expr_bufs,
+                    _visited,
+                    reusable_expr_predicate,
+                )
+            else:
+                try:
+                    src = float(op_str)
+                except (ValueError, TypeError):
+                    src = op_str
+
+            src_dtype = var_dtypes.get(op_str)
+            dst_dtype = var_dtypes.get(var_name)
+            if src == target_buf or (src_dtype is not None and src_dtype == dst_dtype):
+                if cacheable_expr and expr_key is not None:
+                    reusable_expr_bufs[expr_key] = src
+                return src
+            ops_list.append(("copy", [src], target_buf, dst_dtype))
+            if cacheable_expr and expr_key is not None:
+                reusable_expr_bufs[expr_key] = target_buf
+            return target_buf
+
         resolved = []
         for op in operands:
             op_str = str(op)
@@ -1202,8 +1338,10 @@ def _build_vec_ops(
                     var_bufs,
                     var_ops,
                     var_consts,
+                    var_dtypes,
                     reusable_expr_bufs,
                     _visited,
+                    reusable_expr_predicate,
                 )
                 resolved.append(src)
             else:
@@ -1212,7 +1350,9 @@ def _build_vec_ops(
                     resolved.append(float(op_str))
                 except (ValueError, TypeError):
                     resolved.append(op_str)
-        ops_list.append((op_name, resolved, target_buf))
+        ops_list.append((op_name, resolved, target_buf, var_dtypes.get(var_name)))
+        if cacheable_expr and expr_key is not None:
+            reusable_expr_bufs[expr_key] = target_buf
         return target_buf
 
     # Fallback: treat as a literal / unknown symbol
@@ -1952,20 +2092,22 @@ class TileLangKernel(NPUIndexTritonKernel):
         x_base: str = "cid * _XBLOCK",
         r_base: str = "0",
         copy_r: str = "_RBLOCK",
+        dst: Optional[str] = None,
     ) -> None:
+        dst = dst or loc
         index = self._tl_input_indices.get(loc, sympy.S.Zero)
         reduction_numel = self.numels.get("r", sympy.S.One)
         if _is_dense_reduction_matrix_index(index, reduction_numel):
             code.writeline(
                 f"T.copy({var}[{x_base}:{x_base} + {copy_len}, "
                 f"{r_base}:{r_base} + {copy_r}], "
-                f"{loc}[0:{copy_len}, 0:{copy_r}])"
+                f"{dst}[0:{copy_len}, 0:{copy_r}])"
             )
             return
         code.writeline(
             f"T.copy({var}["
             f"{self._reduction_matrix_start_index_tuple(index, x_base, r_base)}], "
-            f"{loc})"
+            f"{dst})"
         )
 
     def _emit_reduction_matrix_store(
@@ -2144,6 +2286,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                 _build_vec_ops(
                     result_var, out_loc, ops_list,
                     self._var_bufs, self._var_ops, self._var_consts,
+                    self._var_dtypes,
                 )
 
                 if not ops_list:
@@ -2153,9 +2296,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                         code.writeline(f"T.copy({src}, {out_loc})")
                     continue
 
-                # Fix the last op to write directly into out_loc
-                last_op, last_operands, _ = ops_list[-1]
-                ops_list[-1] = (last_op, last_operands, out_loc)
+                _finalize_vec_ops_output(ops_list, out_loc, dtype)
 
                 self._emit_vec_ops_with_lifetime_reuse(
                     code,
@@ -2364,6 +2505,35 @@ class TileLangKernel(NPUIndexTritonKernel):
                     buffer_shapes[loc] = shape
 
                 input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
+                input_vars_by_loc = {
+                    loc: var for _, (var, loc, _) in self._tl_inputs.items()
+                }
+                loop_invariant_expr_bufs: dict[tuple, str] = {}
+
+                def is_r_loop_invariant_expr(
+                    var_name: str,
+                    _visited: Optional[set[str]] = None,
+                ) -> bool:
+                    if _visited is None:
+                        _visited = set()
+                    if var_name in _visited:
+                        return True
+                    _visited.add(var_name)
+                    if var_name in self._var_consts:
+                        return True
+                    if var_name in self._var_bufs:
+                        loc = self._var_bufs[var_name]
+                        if loc not in input_locs:
+                            return True
+                        return self._reduction_input_kind(loc) in {"scalar", "row_broadcast"}
+                    if var_name not in self._var_ops:
+                        return False
+                    _, operands = self._var_ops[var_name]
+                    return all(
+                        is_r_loop_invariant_expr(str(operand), _visited)
+                        for operand in operands
+                    )
+
                 already_allocated = set(input_locs)
                 scalar_cache: dict[tuple[str, str], str] = {}
                 for _, (var, loc, dtype) in self._tl_outputs.items():
@@ -2398,7 +2568,8 @@ class TileLangKernel(NPUIndexTritonKernel):
                             return None
                         return planned_shapes.get(operand)
 
-                    for op_name, operands, logical_out_buf in ops_list:
+                    for op_record in ops_list:
+                        op_name, operands, logical_out_buf, _ = _vec_op_parts(op_record)
                         operand_shapes = [
                             shape for shape in (
                                 operand_shape(operand) for operand in operands
@@ -2424,14 +2595,18 @@ class TileLangKernel(NPUIndexTritonKernel):
                     local_shape: str,
                     dtype: torch.dtype,
                 ) -> None:
-                    for loc, shape in infer_vec_op_shapes(
+                    planned_shapes = infer_vec_op_shapes(
                         ops_list, local_shape, buffer_shapes
-                    ).items():
+                    )
+                    for op_record in ops_list:
+                        _, _, loc, _ = _vec_op_parts(op_record)
+                        shape = planned_shapes[loc]
                         if loc in already_allocated:
                             continue
+                        op_dtype = _vec_op_dtype(op_record, dtype)
                         code.writeline(
                             f"{loc} = T.alloc_shared({shape}, "
-                            f"'{tilelang_dtype(dtype)}')"
+                            f"'{tilelang_dtype(op_dtype)}')"
                         )
                         already_allocated.add(loc)
                         buffer_shapes[loc] = shape
@@ -2447,10 +2622,11 @@ class TileLangKernel(NPUIndexTritonKernel):
                         self._var_bufs,
                         self._var_ops,
                         self._var_consts,
+                        self._var_dtypes,
                         {},
                     )
                     if ops_list:
-                        last_op, last_operands, _ = ops_list[-1]
+                        last_op, last_operands, _, _ = _vec_op_parts(ops_list[-1])
                         if not (
                             last_op == "exp"
                             and len(last_operands) == 1
@@ -2461,7 +2637,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                             }
                             and last_operands[0] not in self._reduction_outputs
                         ):
-                            ops_list[-1] = (last_op, last_operands, reduce_input)
+                            ops_list[-1] = _vec_op_with_out(ops_list[-1], reduce_input)
                     predeclare_vec_temps(ops_list, matrix_local_shape, dtype)
 
                 if vector_epilogue_locs:
@@ -2479,11 +2655,11 @@ class TileLangKernel(NPUIndexTritonKernel):
                             self._var_bufs,
                             self._var_ops,
                             self._var_consts,
+                            self._var_dtypes,
                             {},
                         )
                         if ops_list:
-                            last_op, last_operands, _ = ops_list[-1]
-                            ops_list[-1] = (last_op, last_operands, out_loc)
+                            _finalize_vec_ops_output(ops_list, out_loc, dtype)
                         predeclare_vec_temps(
                             ops_list,
                             matrix_local_shape
@@ -2516,12 +2692,18 @@ class TileLangKernel(NPUIndexTritonKernel):
                             )
                     code.writeline("")
     
-                    def emit_r_tile_loads(required_locs: set[str]) -> None:
+                    def emit_r_tile_loads(
+                        required_locs: set[str],
+                        target_locs: Optional[dict[str, str]] = None,
+                    ) -> None:
+                        target_locs = target_locs or {}
                         for _, (var, loc, _) in self._tl_inputs.items():
                             if loc not in required_locs:
                                 continue
                             kind = self._reduction_input_kind(loc)
                             if kind == "col_vector":
+                                if loc in target_locs:
+                                    continue
                                 code.writeline(
                                     f"T.copy({var}[0, _r_base:_r_base + _remain_R], "
                                     f"{loc}[0, 0:_remain_R])"
@@ -2535,7 +2717,35 @@ class TileLangKernel(NPUIndexTritonKernel):
                                     "_tl_base",
                                     "_r_base",
                                     "_remain_R",
+                                    dst=target_locs.get(loc),
                                 )
+
+                    def emit_direct_input_copy(
+                        op_name: str,
+                        operands: list[Any],
+                        out_buf: str,
+                    ) -> bool:
+                        if op_name != "copy" or len(operands) != 1:
+                            return False
+                        operand = operands[0]
+                        if not isinstance(operand, str) or operand not in input_locs:
+                            return False
+                        if self._reduction_input_kind(operand) != "matrix":
+                            return False
+                        var = input_vars_by_loc.get(operand)
+                        if var is None:
+                            return False
+                        self._emit_reduction_matrix_load(
+                            code,
+                            var,
+                            operand,
+                            "_remain_X",
+                            "_tl_base",
+                            "_r_base",
+                            "_remain_R",
+                            dst=out_buf,
+                        )
+                        return True
     
                     for out_loc, (result_var, dtype) in self._reduction_outputs.items():
                         reduction_type, value, _ = self._reduction_vars[str(result_var)]
@@ -2544,7 +2754,6 @@ class TileLangKernel(NPUIndexTritonKernel):
                             reduce_input = f"_{result_var}_reduce_in"
                             ops_list: list[tuple] = []
                             required_locs = collect_input_locs(value)
-                            emit_r_tile_loads(required_locs)
     
                             src = _build_vec_ops(
                                 value,
@@ -2553,11 +2762,13 @@ class TileLangKernel(NPUIndexTritonKernel):
                                 self._var_bufs,
                                 self._var_ops,
                                 self._var_consts,
-                                {},
+                                self._var_dtypes,
+                                loop_invariant_expr_bufs,
+                                reusable_expr_predicate=is_r_loop_invariant_expr,
                             )
     
                             if ops_list:
-                                last_op, last_operands, _ = ops_list[-1]
+                                last_op, last_operands, _, _ = _vec_op_parts(ops_list[-1])
                                 if (
                                     last_op == "exp"
                                     and len(last_operands) == 1
@@ -2576,7 +2787,8 @@ class TileLangKernel(NPUIndexTritonKernel):
                                     )
                                     already_allocated.add(reduce_input)
                                     buffer_shapes[reduce_input] = matrix_local_shape
-                                ops_list[-1] = (last_op, last_operands, reduce_input)
+                                ops_list[-1] = _vec_op_with_out(ops_list[-1], reduce_input)
+                                ops_list = _delay_input_copy_ops(ops_list, input_locs)
     
                             self._emit_vec_ops_with_lifetime_reuse(
                                 code,
@@ -2586,9 +2798,26 @@ class TileLangKernel(NPUIndexTritonKernel):
                                 scalar_cache,
                                 already_allocated,
                                 buffer_shapes,
+                                before_op=lambda op_name, operands, out_buf: (
+                                    emit_direct_input_copy(op_name, operands, out_buf)
+                                    or (
+                                        emit_r_tile_loads({
+                                            operand
+                                            for operand in operands
+                                            if (
+                                                isinstance(operand, str)
+                                                and operand in input_locs
+                                                and operand in required_locs
+                                            )
+                                        })
+                                        or False
+                                    )
+                                ),
                             )
     
                             reduce_src = reduce_input if ops_list else src
+                            if not ops_list:
+                                emit_r_tile_loads(required_locs)
                             code.writeline(
                                 f"T.reduce({reduce_src}, {out_loc}, dims={reduce_dims}, "
                                 f"reduce_mode='{reduction_type}', clear={clear!r}, "
@@ -2610,6 +2839,66 @@ class TileLangKernel(NPUIndexTritonKernel):
                         code.writeline("")
     
                     if vector_epilogue_locs:
+                        def emit_vector_epilogue_invariants() -> None:
+                            def collect_invariant_subexprs(
+                                var,
+                                invariant_vars: list[str],
+                                seen: set[str],
+                                is_root: bool = False,
+                            ) -> None:
+                                var_name = str(var)
+                                if var_name in seen:
+                                    return
+                                seen.add(var_name)
+                                if var_name not in self._var_ops:
+                                    return
+                                _, operands = self._var_ops[var_name]
+                                for operand in operands:
+                                    collect_invariant_subexprs(
+                                        operand, invariant_vars, seen
+                                    )
+                                if (
+                                    not is_root
+                                    and is_r_loop_invariant_expr(var_name)
+                                ):
+                                    invariant_vars.append(var_name)
+
+                            for out_loc, (result_var, dtype) in self._output_vars.items():
+                                if out_loc not in vector_epilogue_locs:
+                                    continue
+                                invariant_vars: list[str] = []
+                                collect_invariant_subexprs(
+                                    result_var, invariant_vars, set(), is_root=True
+                                )
+                                if not invariant_vars:
+                                    continue
+
+                                ops_list: list[tuple] = []
+                                for var_name in invariant_vars:
+                                    _build_vec_ops(
+                                        var_name,
+                                        f"_{var_name}_frag",
+                                        ops_list,
+                                        self._var_bufs,
+                                        self._var_ops,
+                                        self._var_consts,
+                                        self._var_dtypes,
+                                        loop_invariant_expr_bufs,
+                                        reusable_expr_predicate=is_r_loop_invariant_expr,
+                                    )
+                                if not ops_list:
+                                    continue
+
+                                self._emit_vec_ops_with_lifetime_reuse(
+                                    code,
+                                    ops_list,
+                                    scalar_reduce_shape,
+                                    dtype,
+                                    scalar_cache,
+                                    already_allocated,
+                                    buffer_shapes,
+                                )
+
                         def emit_vector_epilogue_tile() -> None:
                             for out_loc, (result_var, dtype) in self._output_vars.items():
                                 if out_loc not in vector_epilogue_locs:
@@ -2627,9 +2916,12 @@ class TileLangKernel(NPUIndexTritonKernel):
                                         loaded_locs.add(loc)
 
                                 def emit_operand_loads(
+                                    op_name: str,
                                     operands: list[Any],
-                                    _out_buf: str,
-                                ) -> None:
+                                    out_buf: str,
+                                ) -> bool:
+                                    if emit_direct_input_copy(op_name, operands, out_buf):
+                                        return True
                                     emit_epilogue_loads({
                                         operand
                                         for operand in operands
@@ -2639,6 +2931,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                                             and operand in required_locs
                                         )
                                     })
+                                    return False
     
                                 src = _build_vec_ops(
                                     result_var,
@@ -2647,7 +2940,9 @@ class TileLangKernel(NPUIndexTritonKernel):
                                     self._var_bufs,
                                     self._var_ops,
                                     self._var_consts,
-                                    {},
+                                    self._var_dtypes,
+                                    loop_invariant_expr_bufs,
+                                    reusable_expr_predicate=is_r_loop_invariant_expr,
                                 )
     
                                 if not ops_list:
@@ -2656,8 +2951,8 @@ class TileLangKernel(NPUIndexTritonKernel):
                                         code.writeline(f"T.copy({src}, {out_loc})")
                                     continue
     
-                                last_op, last_operands, _ = ops_list[-1]
-                                ops_list[-1] = (last_op, last_operands, out_loc)
+                                _finalize_vec_ops_output(ops_list, out_loc, dtype)
+                                ops_list = _delay_input_copy_ops(ops_list, input_locs)
     
                                 self._emit_vec_ops_with_lifetime_reuse(
                                     code,
@@ -2676,6 +2971,7 @@ class TileLangKernel(NPUIndexTritonKernel):
                                         code, var, loc, "_remain_X", "_tl_base", "_r_base", "_remain_R"
                                     )
 
+                        emit_vector_epilogue_invariants()
                         if reduce_axis_no_loop:
                             code.writeline("_r_base = 0")
                             code.writeline("_remain_R = _rnumel")
@@ -2709,13 +3005,13 @@ class TileLangKernel(NPUIndexTritonKernel):
                             self._var_bufs,
                             self._var_ops,
                             self._var_consts,
+                            self._var_dtypes,
                         )
                         if not ops_list:
                             if src != out_loc:
                                 code.writeline(f"T.copy({src}, {out_loc})")
                             continue
-                        last_op, last_operands, _ = ops_list[-1]
-                        ops_list[-1] = (last_op, last_operands, out_loc)
+                        _finalize_vec_ops_output(ops_list, out_loc, dtype)
                         self._emit_vec_ops_with_lifetime_reuse(
                             code,
                             ops_list,
@@ -2764,32 +3060,40 @@ class TileLangKernel(NPUIndexTritonKernel):
 
         op_name, operands = self._var_ops[var_name]
 
-        if op_name in _BINARY_VEC_OPS:
+        op_dtype = self._var_dtypes.get(var_name, dtype)
+
+        if op_name == "to_dtype":
+            pass
+        elif op_name in _BINARY_VEC_OPS:
             _, supported = _BINARY_VEC_OPS[op_name]
-            if dtype not in supported:
+            if op_dtype not in supported:
                 raise NotImplementedError(
                     f"TileLang NPU: op '{op_name}' (T.{_BINARY_VEC_OPS[op_name][0]}) "
-                    f"does not support dtype {dtype}; supported: {supported}. "
+                    f"does not support dtype {op_dtype}; supported: {supported}. "
                     f"Falling back to Triton."
                 )
         elif op_name in _UNARY_VEC_OPS:
             _, supported = _UNARY_VEC_OPS[op_name]
-            if dtype not in supported:
+            if op_dtype not in supported:
                 raise NotImplementedError(
                     f"TileLang NPU: op '{op_name}' (T.{_UNARY_VEC_OPS[op_name][0]}) "
-                    f"does not support dtype {dtype}; supported: {supported}. "
+                    f"does not support dtype {op_dtype}; supported: {supported}. "
                     f"Falling back to Triton."
                 )
         elif op_name == "neg":
             _, supported = _BINARY_VEC_OPS["mul"]
-            if dtype not in supported:
+            if op_dtype not in supported:
                 raise NotImplementedError(
-                    f"TileLang NPU: neg (via vmul * -1) does not support dtype {dtype}. "
+                    f"TileLang NPU: neg (via vmul * -1) does not support dtype {op_dtype}. "
                     f"Falling back to Triton."
                 )
 
         for op in operands:
-            self._check_op_graph_dtype(str(op), dtype, _visited)
+            self._check_op_graph_dtype(
+                str(op),
+                self._var_dtypes.get(str(op), op_dtype),
+                _visited,
+            )
 
     @staticmethod
     def _materialize_scalar_operands(
@@ -2834,7 +3138,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         scalar_cache: dict[tuple[str, str], str],
         already_allocated: set[str],
         buffer_shapes: Optional[dict[str, str]] = None,
-        before_op: Optional[Callable[[list[Any], str], None]] = None,
+        before_op: Optional[Callable[[str, list[Any], str], Optional[bool]]] = None,
     ) -> None:
         """
         Emit a linearized vector-op list while reusing temporary TileLang buffers.
@@ -2846,11 +3150,13 @@ class TileLangKernel(NPUIndexTritonKernel):
         protected_buffers = set(already_allocated)
         use_counts: dict[str, int] = {}
         buffer_map: dict[str, str] = {}
-        free_buffers: dict[str, list[str]] = {}
+        buffer_dtypes: dict[str, torch.dtype] = {}
+        free_buffers: dict[tuple[str, torch.dtype], list[str]] = {}
         if buffer_shapes is None:
             buffer_shapes = {}
 
-        for _op_name, operands, _out_buf in ops_list:
+        for op_record in ops_list:
+            _, operands, _, _ = _vec_op_parts(op_record)
             for operand in operands:
                 if isinstance(operand, str):
                     use_counts[operand] = use_counts.get(operand, 0) + 1
@@ -2891,31 +3197,37 @@ class TileLangKernel(NPUIndexTritonKernel):
                 return operand_shapes[0]
             return local_shape
 
-        def _allocate_buffer(logical_buf: str, shape: str) -> str:
+        def _allocate_buffer(
+            logical_buf: str,
+            shape: str,
+            op_dtype: torch.dtype,
+        ) -> str:
             if logical_buf in buffer_map:
                 return buffer_map[logical_buf]
             if logical_buf in already_allocated:
                 actual_buf = logical_buf
-            elif free_buffers.get(shape):
-                actual_buf = free_buffers[shape].pop()
+            elif free_buffers.get((shape, op_dtype)):
+                actual_buf = free_buffers[(shape, op_dtype)].pop()
             else:
                 actual_buf = logical_buf
                 code.writeline(
                     f"{actual_buf} = T.alloc_shared({shape}, "
-                    f"'{tilelang_dtype(dtype)}')"
+                    f"'{tilelang_dtype(op_dtype)}')"
                 )
                 already_allocated.add(actual_buf)
             buffer_map[logical_buf] = actual_buf
             buffer_shapes[logical_buf] = shape
             buffer_shapes[actual_buf] = shape
+            buffer_dtypes[logical_buf] = op_dtype
+            buffer_dtypes[actual_buf] = op_dtype
             return actual_buf
 
-        for op_name, operands, logical_out_buf in ops_list:
+        for op_record in ops_list:
+            op_name, operands, logical_out_buf, _ = _vec_op_parts(op_record)
+            op_dtype = _vec_op_dtype(op_record, dtype)
             resolved_operands = [_resolve_buffer(operand) for operand in operands]
             shape = _result_shape(op_name, resolved_operands, logical_out_buf)
-            out_buf = _allocate_buffer(logical_out_buf, shape)
-            if before_op is not None:
-                before_op(resolved_operands, out_buf)
+            out_buf = _allocate_buffer(logical_out_buf, shape, op_dtype)
             emit_op_name = op_name
             emit_operands = resolved_operands
             if (
@@ -2930,12 +3242,16 @@ class TileLangKernel(NPUIndexTritonKernel):
                     resolved_operands[0],
                     1.0 / float(resolved_operands[1]),
                 ]
-            materialized_operands = self._materialize_scalar_operands(
-                code, emit_op_name, emit_operands, dtype, scalar_cache
-            )
-            code.writeline(
-                self._emit_vec_op(emit_op_name, materialized_operands, out_buf)
-            )
+            skip_emit = False
+            if before_op is not None:
+                skip_emit = bool(before_op(emit_op_name, emit_operands, out_buf))
+            if not skip_emit:
+                materialized_operands = self._materialize_scalar_operands(
+                    code, emit_op_name, emit_operands, op_dtype, scalar_cache
+                )
+                code.writeline(
+                    self._emit_vec_op(emit_op_name, materialized_operands, out_buf)
+                )
 
             for operand in operands:
                 if not isinstance(operand, str):
@@ -2949,12 +3265,19 @@ class TileLangKernel(NPUIndexTritonKernel):
                     and actual_operand not in protected_buffers
                     and actual_operand != out_buf
                     and actual_operand not in free_buffers.setdefault(
-                        buffer_shapes.get(actual_operand, local_shape), []
+                        (
+                            buffer_shapes.get(actual_operand, local_shape),
+                            buffer_dtypes.get(actual_operand, dtype),
+                        ),
+                        [],
                     )
                 ):
-                    free_buffers[buffer_shapes.get(actual_operand, local_shape)].append(
-                        actual_operand
-                    )
+                    free_buffers[
+                        (
+                            buffer_shapes.get(actual_operand, local_shape),
+                            buffer_dtypes.get(actual_operand, dtype),
+                        )
+                    ].append(actual_operand)
 
     @staticmethod
     def _emit_vec_op(op_name: str, operands: list, out_buf: str) -> str:
@@ -2969,6 +3292,10 @@ class TileLangKernel(NPUIndexTritonKernel):
             vec_fn, _ = _UNARY_VEC_OPS[op_name]
             a = _resolve_operand(operands[0])
             return f"T.{vec_fn}({a}, {out_buf})"
+
+        if op_name == "copy":
+            a = _resolve_operand(operands[0])
+            return f"T.copy({a}, {out_buf})"
 
         # neg: implement as vmul(x, -1.0, out)
         if op_name == "neg":
@@ -2996,7 +3323,13 @@ class TileLangKernel(NPUIndexTritonKernel):
         # _pending_op is cleared in load() before load-expr generate calls,
         # so only compute-expression vars pick it up here.
         if self._pending_op is not None:
-            op_name, operands = self._pending_op[0], self._pending_op[1]
+            op_name, operands, op_dtype = (
+                self._pending_op[0],
+                self._pending_op[1],
+                self._pending_op[2],
+            )
+            if dtype is None and op_dtype is not None:
+                self._var_dtypes[name] = op_dtype
             if op_name == "const":
                 self._var_consts[name] = operands[0]  # e.g. "tmp1" -> "2.0"
             else:
