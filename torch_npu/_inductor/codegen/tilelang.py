@@ -45,6 +45,7 @@ Known limitations:
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
 import re
 from typing import Any, Callable, Optional, Sequence
@@ -540,6 +541,9 @@ _DEFAULT_REDUCTION_XBLOCK = 8
 _DEFAULT_REDUCTION_RBLOCK = 1024
 _TILELANG_AUTOTUNE_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE"
 _TILELANG_AUTOTUNE_CANDIDATES_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE_CANDIDATES"
+_TILELANG_CONFIG_GENERATORS_ENV = "INDUCTOR_ASCEND_TILELANG_CONFIG_GENERATORS"
+_TILELANG_CARVER_TOPK_ENV = "INDUCTOR_ASCEND_TILELANG_CARVER_TOPK"
+_TILELANG_CARVER_CUSTOM_MEM_MUL_ENV = "INDUCTOR_ASCEND_TILELANG_CARVER_CUSTOM_MEM_MUL"
 _TILELANG_AUTOTUNE_WARMUP_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE_WARMUP"
 _TILELANG_AUTOTUNE_REP_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE_REP"
 _TILELANG_AUTOTUNE_TIMEOUT_ENV = "INDUCTOR_ASCEND_TILELANG_AUTOTUNE_TIMEOUT"
@@ -559,6 +563,13 @@ def _tilelang_env_int(name: str, default: int) -> int:
         return default
 
 
+def _tilelang_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _tilelang_autotune_enabled() -> bool:
     return _tilelang_env_flag(_TILELANG_AUTOTUNE_ENV, True)
 
@@ -573,6 +584,40 @@ def _tilelang_autotune_rep() -> int:
 
 def _tilelang_autotune_timeout() -> int:
     return max(1, _tilelang_env_int(_TILELANG_AUTOTUNE_TIMEOUT_ENV, 30))
+
+
+def _tilelang_config_generators() -> tuple[str, ...]:
+    raw = os.getenv(_TILELANG_CONFIG_GENERATORS_ENV, "tile_generator")
+    aliases = {
+        "tile_generator": "tile_generator",
+        "tile-generator": "tile_generator",
+        "tilegen": "tile_generator",
+        "generator": "tile_generator",
+        "default": "tile_generator",
+        "carver": "carver",
+    }
+    values: list[str] = []
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item in {"all", "both"}:
+            for value in ("tile_generator", "carver"):
+                if value not in values:
+                    values.append(value)
+            continue
+        value = aliases.get(item)
+        if value is not None and value not in values:
+            values.append(value)
+    return tuple(values or ("tile_generator",))
+
+
+def _tilelang_carver_topk() -> int:
+    return max(1, _tilelang_env_int(_TILELANG_CARVER_TOPK_ENV, 30))
+
+
+def _tilelang_carver_custom_mem_mul() -> float:
+    return max(0.0, _tilelang_env_float(_TILELANG_CARVER_CUSTOM_MEM_MUL_ENV, 8.0))
 
 
 def _tilelang_parse_xblock_candidate_filter() -> Optional[set[int]]:
@@ -609,7 +654,7 @@ def _tilelang_xblock_configs(
     persistent_reduction: bool = False,
     dual_reduction: bool = False,
 ) -> list[dict[str, int]]:
-    """Generate TileLang tiling configs using Triton-Ascend's TileGenerator."""
+    """Generate TileLang tiling configs for TileLang autotuning."""
     xnumel = max(1, int(xnumel))
     rnumel = max(1, int(rnumel))
     buffer_count = min(max(1, int(buffer_count)), 3)
@@ -706,50 +751,72 @@ def _tilelang_xblock_configs(
     if reduce_axis_no_loop:
         fallback_rblock = rnumel
 
-    try:
-        tile_generator = TileGenerator(
-            tile_axis_numels,
-            tile_axis_names,
-            tiling_axis=tile_tiling_axis,
-            no_loop_axis=tile_no_loop_axis,
-            split_axis=tile_split_axis,
-            low_dims=tile_low_dims,
-            persistent_reduction=bool(persistent_reduction),
-            dtype=dtype,
-            npu_kernel_type=NPUKernelType.SIMD,
-            input_ptr_num=buffer_count,
-            dual_reduction=bool(dual_reduction),
-        )
-        tile_configs = tile_generator.descend_split_tiling()
-    except Exception:
-        tile_configs = []
+    allowed = _tilelang_parse_xblock_candidate_filter()
+    configs: list[dict[str, int]] = []
+    seen: set[tuple[int, int, int]] = set()
 
-    if is_reduction and not tile_configs:
+    def add_config(x0block: int, x0block_sub: int, r0block: int) -> None:
+        x0block = max(1, int(x0block))
+        x0block_sub = min(max(1, int(x0block_sub)), x0block)
+        if reduce_axis_no_loop:
+            r0block = rnumel
+        r0block = min(max(1, int(r0block)), rnumel)
+        if allowed is not None and x0block not in allowed:
+            return
+        key = (x0block, x0block_sub, r0block if is_reduction else 1)
+        if key in seen:
+            return
+        seen.add(key)
+        config = {"X0BLOCK": x0block, "X0BLOCK_SUB": x0block_sub}
+        if is_reduction:
+            config["R0BLOCK"] = r0block
+        configs.append(config)
+
+    def add_tile_generator_configs() -> None:
         try:
             tile_generator = TileGenerator(
-                [xnumel],
-                ["x0"],
-                tiling_axis=[],
-                no_loop_axis=[],
-                split_axis=[0],
-                low_dims=[],
-                persistent_reduction=False,
+                tile_axis_numels,
+                tile_axis_names,
+                tiling_axis=tile_tiling_axis,
+                no_loop_axis=tile_no_loop_axis,
+                split_axis=tile_split_axis,
+                low_dims=tile_low_dims,
+                persistent_reduction=bool(persistent_reduction),
                 dtype=dtype,
                 npu_kernel_type=NPUKernelType.SIMD,
                 input_ptr_num=buffer_count,
+                dual_reduction=bool(dual_reduction),
             )
             tile_configs = tile_generator.descend_split_tiling()
         except Exception:
             tile_configs = []
 
-    allowed = _tilelang_parse_xblock_candidate_filter()
-    configs: list[dict[str, int]] = []
-    seen: set[tuple[int, int, int]] = set()
-    for cfg in tile_configs:
+        if is_reduction and not tile_configs:
+            try:
+                tile_generator = TileGenerator(
+                    [xnumel],
+                    ["x0"],
+                    tiling_axis=[],
+                    no_loop_axis=[],
+                    split_axis=[0],
+                    low_dims=[],
+                    persistent_reduction=False,
+                    dtype=dtype,
+                    npu_kernel_type=NPUKernelType.SIMD,
+                    input_ptr_num=buffer_count,
+                )
+                tile_configs = tile_generator.descend_split_tiling()
+            except Exception:
+                tile_configs = []
+
+        for cfg in tile_configs:
+            add_tile_generator_config(cfg)
+
+    def add_tile_generator_config(cfg: Any) -> None:
         cfg_kwargs = getattr(cfg, "kwargs", {})
         x0block = first_config_value(cfg_kwargs, "X", "BLOCK")
         if x0block is None:
-            continue
+            return
         x0block = int(x0block)
         x0block_sub = first_config_value(cfg_kwargs, "X", "BLOCK_SUB")
         x0block_sub = int(x0block_sub if x0block_sub is not None else x0block)
@@ -757,32 +824,69 @@ def _tilelang_xblock_configs(
         if r0block is None:
             r0block = first_config_value(cfg_kwargs, "R", "BLOCK_SUB")
         r0block = int(r0block if r0block is not None else fallback_rblock)
-        if reduce_axis_no_loop:
-            r0block = rnumel
-        r0block = min(max(1, r0block), rnumel)
-        if allowed is not None and x0block not in allowed:
-            continue
-        key = (x0block, x0block_sub, r0block if is_reduction else 1)
-        if key in seen:
-            continue
-        seen.add(key)
-        config = {"X0BLOCK": x0block, "X0BLOCK_SUB": x0block_sub}
-        if is_reduction:
-            config["R0BLOCK"] = r0block
-        configs.append(config)
+        add_config(x0block, x0block_sub, r0block)
+
+    def add_carver_configs() -> None:
+        try:
+            from tilelang import carver
+            from tilelang.utils.npu_arch import AscendArch
+        except Exception:
+            return
+
+        try:
+            custom_mem_mul = _tilelang_carver_custom_mem_mul()
+            if is_reduction:
+                structure = "".join(
+                    "R" if name.startswith("r") else "S"
+                    for name in tile_axis_names
+                )
+                if "R" not in structure or "S" not in structure:
+                    structure = "SR"
+                    shape = [xnumel, rnumel]
+                else:
+                    shape = tile_axis_numels
+                carver_template = carver.GeneralReductionTemplate(
+                    structure=structure,
+                    shape=list(shape),
+                    dtype=tilelang_dtype(dtype),
+                    custom_mem_mul=custom_mem_mul,
+                ).with_arch(AscendArch())
+            else:
+                carver_template = carver.ElementwiseTemplate(
+                    shape=[xnumel],
+                    dtype=tilelang_dtype(dtype),
+                    custom_mem_mul=custom_mem_mul,
+                ).with_arch(AscendArch())
+
+            hints = carver_template.recommend_hints(topk=_tilelang_carver_topk())
+        except Exception:
+            return
+
+        for hint in hints:
+            block = [int(value) for value in getattr(hint, "block", [])]
+            if not block:
+                continue
+            x0block = functools.reduce(lambda x, y: x * y, block)
+            if is_reduction:
+                rstep = [int(value) for value in getattr(hint, "rstep", [])]
+                if not rstep:
+                    continue
+                r0block = functools.reduce(lambda x, y: x * y, rstep)
+            else:
+                r0block = fallback_rblock
+            add_config(x0block, x0block, r0block)
+
+    for generator in _tilelang_config_generators():
+        if generator == "tile_generator":
+            add_tile_generator_configs()
+        elif generator == "carver":
+            add_carver_configs()
 
     if allowed is None or fallback_hint in allowed:
-        fallback_key = (fallback_hint, fallback_hint, fallback_rblock if is_reduction else 1)
-        if fallback_key not in seen:
-            config = {"X0BLOCK": fallback_hint, "X0BLOCK_SUB": fallback_hint}
-            if is_reduction:
-                config["R0BLOCK"] = fallback_rblock
-            configs.append(config)
+        add_config(fallback_hint, fallback_hint, fallback_rblock)
     if not configs:
-        config = {"X0BLOCK": fallback_hint, "X0BLOCK_SUB": fallback_hint}
-        if is_reduction:
-            config["R0BLOCK"] = fallback_rblock
-        configs.append(config)
+        allowed = None
+        add_config(fallback_hint, fallback_hint, fallback_rblock)
     return configs
 
 _TILELANG_NPUIR_PASS_CONFIGS = {
@@ -1162,17 +1266,12 @@ def _finalize_vec_ops_output(
 ) -> None:
     if not ops_list:
         return
-    op_name, _, logical_out_buf, op_dtype = _vec_op_parts(ops_list[-1])
-    op_dtype = op_dtype or out_dtype
-    if op_name == "copy" or op_dtype == out_dtype:
-        ops_list[-1] = _vec_op_with_out(ops_list[-1], out_buf)
-        return
-
-    copy_src = logical_out_buf
-    if copy_src == out_buf:
-        copy_src = f"{out_buf}_cast_src"
-        ops_list[-1] = _vec_op_with_out(ops_list[-1], copy_src)
-    ops_list.append(("copy", [copy_src], out_buf, out_dtype))
+    # Do not use the CSE/op dtype to choose the T.v* result buffer dtype.
+    # T.v* intrinsics require all tensor operands, including the output, to
+    # share element type.  _emit_vec_ops_with_lifetime_reuse derives that
+    # execution dtype from the materialized tensor operands.  Explicit casts
+    # are represented as "copy" ops by to_dtype and keep their own dtype.
+    ops_list[-1] = _vec_op_with_out(ops_list[-1], out_buf)
 
 
 def _delay_input_copy_ops(
@@ -1363,6 +1462,10 @@ def _is_reduction_symbol_name(name: str) -> bool:
     return name == "r" or name == "rindex" or re.match(r"r\d+(?:_|$)", name) is not None
 
 
+def _is_pointwise_symbol_name(name: str) -> bool:
+    return bool(name) and name[0] in "wvtzyx"
+
+
 def _has_reduction_index(index: sympy.Expr) -> bool:
     return any(
         _is_reduction_symbol_name(getattr(symbol, "name", str(symbol)))
@@ -1372,7 +1475,7 @@ def _has_reduction_index(index: sympy.Expr) -> bool:
 
 def _has_pointwise_index(index: sympy.Expr) -> bool:
     return any(
-        getattr(symbol, "name", str(symbol)).startswith("x")
+        _is_pointwise_symbol_name(getattr(symbol, "name", str(symbol)))
         for symbol in index.free_symbols
     )
 
@@ -1381,17 +1484,17 @@ def _dense_reduction_matrix_expected_index(
     index: sympy.Expr,
     reduction_numel: sympy.Expr,
 ) -> Optional[sympy.Expr]:
-    x_symbols = [
+    pointwise_symbols = [
         symbol for symbol in index.free_symbols
-        if getattr(symbol, "name", str(symbol)).startswith("x")
+        if _is_pointwise_symbol_name(getattr(symbol, "name", str(symbol)))
     ]
     r_symbols = [
         symbol for symbol in index.free_symbols
         if _is_reduction_symbol_name(getattr(symbol, "name", str(symbol)))
     ]
-    if len(x_symbols) != 1 or len(r_symbols) != 1:
+    if len(pointwise_symbols) != 1 or len(r_symbols) != 1:
         return None
-    return x_symbols[0] * reduction_numel + r_symbols[0]
+    return pointwise_symbols[0] * reduction_numel + r_symbols[0]
 
 
 def _is_dense_reduction_matrix_index(
@@ -1421,7 +1524,7 @@ def _tilelang_index_expr(
         if expr in symbol_replacements:
             return symbol_replacements[expr]
         name = getattr(expr, "name", str(expr))
-        if name.startswith("x"):
+        if _is_pointwise_symbol_name(name):
             return pointwise_index
         if _is_reduction_symbol_name(name):
             return reduction_index
@@ -1502,6 +1605,8 @@ class TileLangKernel(NPUIndexTritonKernel):
         self._tl_input_numels: dict[str, sympy.Expr] = {}
         self._tl_static_axis_vars: dict[sympy.Symbol, tuple[str, sympy.Expr]] = {}
         self._tl_static_value_vars: dict[tuple[str, str], tuple[str, sympy.Expr]] = {}
+        self._tl_pointwise_axis_lengths: Optional[list[sympy.Expr]] = None
+        self._tl_pointwise_axis_names: Optional[list[str]] = None
         self._pointwise_output_symbols: set[sympy.Symbol] = set()
         self._pointwise_output_index: Optional[sympy.Expr] = None
 
@@ -1533,7 +1638,7 @@ class TileLangKernel(NPUIndexTritonKernel):
             pid_cache = {}
 
         active_prefixes = [
-            prefix for prefix in ("z", "y", "x", "r")
+            prefix for prefix in ("w", "v", "t", "z", "y", "x", "r")
             if prefix in self.numels
         ]
         no_r_dim = not self.inside_reduction or not self.features.is_reduction()
@@ -1541,9 +1646,9 @@ class TileLangKernel(NPUIndexTritonKernel):
         if self.no_x_dim:
             tensor_dims = ["r"]
         elif no_r_dim:
-            tensor_dims = ["z", "y", "x"]
+            tensor_dims = ["x", "y", "z", "t", "v", "w"]
         else:
-            tensor_dims = ["z", "y", "x", "r"]
+            tensor_dims = ["x", "y", "z", "t", "v", "w", "r"]
 
         grid_dims = ["x", "y", "z"]
         tensor_dim_map = {
@@ -1796,10 +1901,510 @@ class TileLangKernel(NPUIndexTritonKernel):
                 index = f"({index} % {numel_var})"
             return index
         index = self._tl_input_indices.get(loc, sympy.S.Zero)
-        return _tilelang_index_expr(
+        index_expr = _tilelang_index_expr(
             index,
             pointwise_index=pointwise_index,
         )
+        if loc in self._tl_input_numels:
+            numel_var = self._static_value_var("B", self._tl_input_numels[loc])
+            index_expr = f"({index_expr} % {numel_var})"
+        return index_expr
+
+    def _pointwise_2d_broadcast_info(
+        self,
+    ) -> Optional[tuple[sympy.Expr, sympy.Expr, dict[str, str]]]:
+        """Return (M, N, loc->axis) for rank-2 pointwise 1D->2D broadcast."""
+        if self._reduction_outputs or not self._tl_outputs:
+            return None
+
+        output_shapes: list[Sequence[sympy.Expr]] = []
+        for name in self._tl_outputs:
+            try:
+                shape = V.graph.get_buffer(name).get_size()
+            except Exception:
+                return None
+            if len(shape) != 2:
+                return None
+            output_shapes.append(shape)
+
+        outer, inner = output_shapes[0]
+        for shape in output_shapes[1:]:
+            if not V.graph.sizevars.statically_known_equals(shape[0], outer):
+                return None
+            if not V.graph.sizevars.statically_known_equals(shape[-1], inner):
+                return None
+
+        def index_broadcast_axis(loc: str) -> Optional[str]:
+            index = self._tl_input_indices.get(loc, sympy.S.Zero)
+            for term in index.atoms(ModularIndexing):
+                _base, divisor, modulus = term.args
+                if (
+                    V.graph.sizevars.statically_known_equals(divisor, sympy.S.One)
+                    and V.graph.sizevars.statically_known_equals(modulus, inner)
+                ):
+                    return "inner"
+                if (
+                    V.graph.sizevars.statically_known_equals(divisor, inner)
+                    and V.graph.sizevars.statically_known_equals(modulus, outer)
+                ):
+                    return "outer"
+            if (
+                isinstance(index, FloorDiv)
+                and V.graph.sizevars.statically_known_equals(index.args[1], inner)
+            ):
+                return "outer"
+            factor = self._pointwise_broadcast_factor(loc)
+            if (
+                factor is not None
+                and V.graph.sizevars.statically_known_equals(factor, inner)
+            ):
+                return "outer"
+            return None
+
+        broadcast_axes: dict[str, str] = {}
+        for name, (_, loc, _) in self._tl_inputs.items():
+            kind = self._pointwise_input_kind(loc)
+            try:
+                input_shape = V.graph.get_buffer(name).get_size()
+            except Exception:
+                return None
+
+            if kind == "broadcast":
+                if len(input_shape) != 1:
+                    return None
+                input_numel = self._tl_input_numels.get(loc, sympy_product(input_shape))
+                matches_inner = V.graph.sizevars.statically_known_equals(input_numel, inner)
+                matches_outer = V.graph.sizevars.statically_known_equals(input_numel, outer)
+                axis = index_broadcast_axis(loc)
+                if axis == "inner" and matches_inner:
+                    broadcast_axes[loc] = axis
+                elif axis == "outer" and matches_outer:
+                    broadcast_axes[loc] = axis
+                elif matches_inner and not matches_outer:
+                    broadcast_axes[loc] = "inner"
+                elif matches_outer and not matches_inner:
+                    broadcast_axes[loc] = "outer"
+                else:
+                    # Ambiguous M == N or unsupported 1D length. Avoid guessing
+                    # when the index pattern does not identify the axis.
+                    return None
+            elif kind == "vector":
+                if len(input_shape) != 2:
+                    return None
+                if not V.graph.sizevars.statically_known_equals(input_shape[0], outer):
+                    return None
+                if not V.graph.sizevars.statically_known_equals(input_shape[-1], inner):
+                    return None
+            else:
+                # Keep this implementation narrow: scalar->2D needs separate
+                # rank-aligned vbrc handling.
+                return None
+
+        return (outer, inner, broadcast_axes) if broadcast_axes else None
+
+    def _tilelang_shape_from_buffer_shape(
+        self,
+        shape: Sequence[sympy.Expr],
+    ) -> str:
+        if not shape:
+            return "(1,)"
+        dims = [self._static_value_var("B", dim) for dim in shape]
+        suffix = "," if len(dims) == 1 else ""
+        return f"({', '.join(dims)}{suffix})"
+
+    @staticmethod
+    def _tilelang_shape_from_dim_strings(dims: Sequence[str]) -> str:
+        suffix = "," if len(dims) == 1 else ""
+        return f"({', '.join(dims)}{suffix})"
+
+    def _axis_dim_var(self, axis, extent: sympy.Expr) -> str:
+        prefix = getattr(axis, "prefix", "")
+        if prefix in self.numels and V.graph.sizevars.statically_known_equals(
+            self.numels[prefix],
+            extent,
+        ):
+            return f"_{prefix}numel"
+        return self._static_value_var("B", extent)
+
+    def _pointwise_layout_axes(self) -> list:
+        if not self.golden_var_list:
+            try:
+                self.select_golden_varlist()
+            except Exception:
+                pass
+
+        axes = []
+        for symbol in reversed(list(self.golden_var_list or [])):
+            axis = (
+                self.range_tree_nodes.get(symbol)
+                or self.range_tree_nodes_removed.get(symbol)
+            )
+            if axis is not None and _is_pointwise_symbol_name(axis.name):
+                axes.append(axis)
+        sorted_axes = [
+            axis for axis in getattr(self, "sorted_axis", [])
+            if _is_pointwise_symbol_name(axis.name)
+        ]
+        if len(sorted_axes) > len(axes):
+            return sorted_axes
+        if axes:
+            return axes
+        return sorted_axes
+
+    def _pointwise_output_axis_groups(
+        self,
+        axes: Sequence[Any],
+        output_shape: Sequence[sympy.Expr],
+    ) -> Optional[list[tuple[int, ...]]]:
+        axis_lengths = [getattr(axis, "length", sympy.S.One) for axis in axes]
+        shape = list(output_shape)
+
+        def matches(actual: sympy.Expr, expected: sympy.Expr) -> bool:
+            return V.graph.sizevars.statically_known_equals(actual, expected)
+
+        def search(axis_index: int, dim_index: int) -> Optional[list[tuple[int, ...]]]:
+            if axis_index == len(axis_lengths):
+                return [] if dim_index == len(shape) else None
+
+            for end in range(dim_index + 1, len(shape) + 1):
+                group = tuple(range(dim_index, end))
+                product = sympy_product([shape[i] for i in group])
+                if not matches(product, axis_lengths[axis_index]):
+                    continue
+                rest = search(axis_index + 1, end)
+                if rest is not None:
+                    return [group, *rest]
+            if matches(sympy.S.One, axis_lengths[axis_index]):
+                rest = search(axis_index + 1, dim_index)
+                if rest is not None:
+                    return [(), *rest]
+            return None
+
+        return search(0, 0)
+
+    @staticmethod
+    def _pointwise_logical_axis_names(rank: int) -> list[str]:
+        prefixes = ("w", "v", "t", "z", "y", "x")[-rank:]
+        return [f"{prefix}{i}" for i, prefix in enumerate(prefixes)]
+
+    def _pointwise_ranked_broadcast_info(self) -> Optional[dict[str, Any]]:
+        self._tl_pointwise_axis_lengths = None
+        self._tl_pointwise_axis_names = None
+
+        if self._reduction_outputs or not self._tl_outputs:
+            return None
+
+        base_axes = self._pointwise_layout_axes()
+        if len(base_axes) <= 1:
+            return None
+
+        def matches(actual: sympy.Expr, expected: sympy.Expr) -> bool:
+            return V.graph.sizevars.statically_known_equals(actual, expected)
+
+        def shape_matches(
+            actual: Sequence[sympy.Expr],
+            expected: Sequence[sympy.Expr],
+        ) -> bool:
+            return (
+                len(actual) == len(expected)
+                and all(matches(a, e) for a, e in zip(actual, expected))
+            )
+
+        output_shapes: list[Sequence[sympy.Expr]] = []
+        output_vars: list[str] = []
+        for name, (var, _, _) in self._tl_outputs.items():
+            try:
+                shape = V.graph.get_buffer(name).get_size()
+            except Exception:
+                return None
+            output_shapes.append(shape)
+            output_vars.append(var)
+
+        output_shape = output_shapes[0]
+        for shape in output_shapes[1:]:
+            if not shape_matches(shape, output_shape):
+                return None
+
+        base_axis_groups = self._pointwise_output_axis_groups(base_axes, output_shape)
+        if base_axis_groups is None:
+            base_axis_lengths_from_axes = [
+                getattr(axis, "length", sympy.S.One) for axis in base_axes
+            ]
+            if not V.graph.sizevars.statically_known_equals(
+                sympy_product(output_shape),
+                sympy_product(base_axis_lengths_from_axes),
+            ):
+                return None
+            output_shape = base_axis_lengths_from_axes
+            base_axis_groups = [(i,) for i in range(len(base_axes))]
+
+        base_axis_lengths = [
+            sympy_product([output_shape[i] for i in group]) if group else sympy.S.One
+            for group in base_axis_groups
+        ]
+
+        axis_prefix_counts: dict[str, int] = {}
+        for axis in base_axes:
+            prefix = getattr(axis, "prefix", "")
+            axis_prefix_counts[prefix] = axis_prefix_counts.get(prefix, 0) + 1
+
+        def axis_deps_from_index(loc: str, axes: Sequence[Any]) -> Optional[tuple[int, ...]]:
+            index = self._tl_input_indices.get(loc, sympy.S.Zero)
+            if _is_zero_index(index):
+                return ()
+            free_symbols = index.free_symbols
+            deps = [
+                i for i, axis in enumerate(axes)
+                if axis.symbol() in free_symbols
+            ]
+            if deps:
+                return tuple(deps)
+            prefix_deps = tuple(
+                i for i, axis in enumerate(axes)
+                if any(
+                    _is_pointwise_symbol_name(getattr(symbol, "name", str(symbol)))
+                    and getattr(symbol, "name", str(symbol))[0] == axis.prefix
+                    and axis_prefix_counts.get(axis.prefix, 0) == 1
+                    for symbol in free_symbols
+                )
+            )
+            return prefix_deps if prefix_deps else None
+
+        def base_axis_deps_from_shape(
+            shape: Sequence[sympy.Expr],
+            index_deps: Optional[tuple[int, ...]],
+        ) -> Optional[tuple[int, ...]]:
+            shape = list(shape)
+
+            if matches(sympy_product(shape), sympy.S.One):
+                return ()
+
+            candidates: list[tuple[int, ...]] = []
+
+            def add_candidate(candidate: tuple[int, ...]) -> None:
+                if candidate not in candidates:
+                    candidates.append(candidate)
+
+            if len(shape) == len(output_shape):
+                deps: list[int] = []
+                valid = True
+                for axis_index, group in enumerate(base_axis_groups):
+                    actual_group = [shape[i] for i in group]
+                    output_group = [output_shape[i] for i in group]
+                    if shape_matches(actual_group, output_group):
+                        deps.append(axis_index)
+                    elif all(matches(dim, sympy.S.One) for dim in actual_group):
+                        continue
+                    else:
+                        valid = False
+                        break
+                if valid:
+                    add_candidate(tuple(deps))
+
+            axis_count = len(base_axis_groups)
+            for mask in range(1, 1 << axis_count):
+                subset = tuple(i for i in range(axis_count) if mask & (1 << i))
+                physical_dims = [
+                    dim
+                    for axis_index in subset
+                    for dim in base_axis_groups[axis_index]
+                ]
+                physical_shape = [output_shape[dim] for dim in physical_dims]
+                if shape_matches(shape, physical_shape):
+                    add_candidate(subset)
+                logical_shape = [base_axis_lengths[axis_index] for axis_index in subset]
+                if shape_matches(shape, logical_shape):
+                    add_candidate(subset)
+                if matches(sympy_product(shape), sympy_product(logical_shape)):
+                    add_candidate(subset)
+
+            if index_deps is not None:
+                for candidate in candidates:
+                    if candidate == index_deps:
+                        return candidate
+
+            if len(candidates) == 1:
+                return candidates[0]
+            return None
+
+        base_axis_deps: dict[str, tuple[int, ...]] = {}
+        input_shapes: dict[str, Sequence[sympy.Expr]] = {}
+        for name, (_, loc, _) in self._tl_inputs.items():
+            try:
+                shape = V.graph.get_buffer(name).get_size()
+            except Exception:
+                return None
+            input_shapes[loc] = shape
+            index_deps = axis_deps_from_index(loc, base_axes)
+            deps = base_axis_deps_from_shape(shape, index_deps)
+            if deps is None:
+                deps = index_deps
+            if deps is None:
+                return None
+            base_axis_deps[loc] = deps
+
+        def merged_axis_index_groups() -> list[tuple[int, ...]]:
+            if any(len(group) != 1 for group in base_axis_groups):
+                return [(i,) for i in range(len(base_axis_groups))]
+
+            groups: list[tuple[int, ...]] = []
+            current: list[int] = []
+            current_signature: Optional[tuple[bool, ...]] = None
+            input_locs = [loc for _, (_, loc, _) in self._tl_inputs.items()]
+            for axis_index in range(len(base_axis_groups)):
+                signature = tuple(
+                    axis_index in base_axis_deps[loc]
+                    for loc in input_locs
+                )
+                if current and signature != current_signature:
+                    groups.append(tuple(current))
+                    current = []
+                current.append(axis_index)
+                current_signature = signature
+            if current:
+                groups.append(tuple(current))
+            return groups
+
+        base_group_index_groups = merged_axis_index_groups()
+        axis_groups = [
+            tuple(dim for base_index in group for dim in base_axis_groups[base_index])
+            for group in base_group_index_groups
+        ]
+        axis_lengths = [
+            sympy_product([base_axis_lengths[base_index] for base_index in group])
+            for group in base_group_index_groups
+        ]
+        if len(axis_groups) <= 1:
+            return None
+
+        axis_dim_vars = []
+        for group, length in zip(base_group_index_groups, axis_lengths):
+            if len(group) == 1:
+                base_axis = base_axes[group[0]]
+                axis_dim_vars.append(self._axis_dim_var(base_axis, length))
+            else:
+                axis_dim_vars.append(self._static_value_var("B", length))
+
+        axis_names = self._pointwise_logical_axis_names(len(axis_groups))
+        full_shape = self._tilelang_shape_from_dim_strings(axis_dim_vars)
+        tensor_shapes: dict[str, str] = {var: full_shape for var in output_vars}
+
+        def logical_deps_from_base_deps(base_deps: tuple[int, ...]) -> Optional[tuple[int, ...]]:
+            base_dep_set = set(base_deps)
+            deps: list[int] = []
+            for axis_index, group in enumerate(base_group_index_groups):
+                present = [base_index in base_dep_set for base_index in group]
+                if all(present):
+                    deps.append(axis_index)
+                elif any(present):
+                    return None
+            return tuple(deps)
+
+        def input_axis_positions(
+            shape: Sequence[sympy.Expr],
+            deps: tuple[int, ...],
+        ) -> Optional[tuple[list[Optional[int]], list[str]]]:
+            shape = list(shape)
+
+            if not deps:
+                if matches(sympy_product(shape), sympy.S.One):
+                    return [None], ["1"]
+                return None
+
+            if len(shape) == len(deps):
+                for actual, axis_index in zip(shape, deps):
+                    if not matches(actual, axis_lengths[axis_index]):
+                        return None
+                return list(deps), [axis_dim_vars[axis_index] for axis_index in deps]
+
+            if len(shape) == len(axis_groups):
+                positions: list[Optional[int]] = []
+                dims: list[str] = []
+                dep_set = set(deps)
+                valid = True
+                for axis_index, actual in enumerate(shape):
+                    if axis_index in dep_set:
+                        if not matches(actual, axis_lengths[axis_index]):
+                            valid = False
+                            break
+                        positions.append(axis_index)
+                        dims.append(axis_dim_vars[axis_index])
+                    else:
+                        if not matches(actual, sympy.S.One):
+                            valid = False
+                            break
+                        positions.append(None)
+                        dims.append("1")
+                if valid:
+                    return positions, dims
+
+            if len(shape) == len(output_shape):
+                positions = []
+                dims = []
+                for axis_index, group in enumerate(axis_groups):
+                    actual_group = [shape[i] for i in group]
+                    output_group = [output_shape[i] for i in group]
+                    if shape_matches(actual_group, output_group):
+                        positions.append(axis_index)
+                        dims.append(axis_dim_vars[axis_index])
+                    elif all(matches(dim, sympy.S.One) for dim in actual_group):
+                        positions.append(None)
+                        dims.append("1")
+                    else:
+                        return None
+                return positions, dims
+
+            dep_output_dims = [
+                dim
+                for axis_index in deps
+                for dim in axis_groups[axis_index]
+            ]
+            dep_output_shape = [output_shape[dim] for dim in dep_output_dims]
+            if shape_matches(shape, dep_output_shape):
+                return list(deps), [axis_dim_vars[axis_index] for axis_index in deps]
+
+            if len(deps) == 1 and matches(sympy_product(shape), axis_lengths[deps[0]]):
+                axis_index = deps[0]
+                return [axis_index], [axis_dim_vars[axis_index]]
+
+            return None
+
+        input_positions: dict[str, list[Optional[int]]] = {}
+        axis_deps: dict[str, tuple[int, ...]] = {}
+        for name, (var, loc, _) in self._tl_inputs.items():
+            shape = input_shapes[loc]
+            deps = logical_deps_from_base_deps(base_axis_deps[loc])
+            if deps is None:
+                return None
+            input_layout = input_axis_positions(shape, deps)
+            if input_layout is None:
+                return None
+            positions, dims = input_layout
+            tensor_shapes[var] = self._tilelang_shape_from_dim_strings(dims)
+            axis_deps[loc] = deps
+            input_positions[loc] = positions
+
+        force_axis0_block_one = any(
+            len(deps) != len(axis_groups) and 0 not in deps
+            for deps in axis_deps.values()
+        )
+        axis0_block_var = "1" if force_axis0_block_one else "_TL_AXIS0_BLOCK"
+        rest_dims = axis_dim_vars[1:]
+        rest_product = " * ".join(rest_dims) if rest_dims else "1"
+        local_dims = [axis0_block_var, *rest_dims]
+        self._tl_pointwise_axis_lengths = axis_lengths
+        self._tl_pointwise_axis_names = axis_names
+        return {
+            "axis_lengths": axis_lengths,
+            "axis_dim_vars": axis_dim_vars,
+            "axis0_block_var": axis0_block_var,
+            "axis_deps": axis_deps,
+            "input_positions": input_positions,
+            "tensor_shapes": tensor_shapes,
+            "full_shape": full_shape,
+            "local_shape": self._tilelang_shape_from_dim_strings(local_dims),
+            "rest_product": rest_product,
+        }
 
     def _reduction_input_kind(self, loc: str) -> str:
         index = self._tl_input_indices.get(loc, sympy.S.Zero)
@@ -1887,8 +2492,8 @@ class TileLangKernel(NPUIndexTritonKernel):
         if node is not None:
             return node.length
         name = getattr(symbol, "name", str(symbol))
-        if name.startswith("x"):
-            return self.numels.get("x", sympy.S.One)
+        if _is_pointwise_symbol_name(name):
+            return self.numels.get(name[0], sympy.S.One)
         if _is_reduction_symbol_name(name):
             return self.numels.get("r", sympy.S.One)
         return sympy.S.One
@@ -1930,7 +2535,7 @@ class TileLangKernel(NPUIndexTritonKernel):
 
         symbols = [
             symbol for symbol in index.free_symbols
-            if getattr(symbol, "name", str(symbol)).startswith("x")
+            if _is_pointwise_symbol_name(getattr(symbol, "name", str(symbol)))
             or _is_reduction_symbol_name(getattr(symbol, "name", str(symbol)))
         ]
         return sorted(symbols, key=stride, reverse=True)
@@ -1938,14 +2543,21 @@ class TileLangKernel(NPUIndexTritonKernel):
     def _reduction_matrix_symbols(self, index: sympy.Expr) -> list[sympy.Symbol]:
         return self._index_symbols_by_stride(index)
 
+    def _reduction_pointwise_tile_symbol(self, index: sympy.Expr) -> Optional[sympy.Symbol]:
+        pointwise_symbols = [
+            symbol for symbol in self._reduction_matrix_symbols(index)
+            if _is_pointwise_symbol_name(getattr(symbol, "name", str(symbol)))
+        ]
+        return pointwise_symbols[0] if pointwise_symbols else None
+
     def _reduction_matrix_dim_expr(self, symbol: sympy.Symbol, index: sympy.Expr) -> str:
         symbols = self._reduction_matrix_symbols(index)
         name = getattr(symbol, "name", str(symbol))
-        if name.startswith("x") and len([
+        if _is_pointwise_symbol_name(name) and len([
             s for s in symbols
-            if getattr(s, "name", str(s)).startswith("x")
+            if _is_pointwise_symbol_name(getattr(s, "name", str(s)))
         ]) == 1:
-            return "_xnumel"
+            return f"_{name[0]}numel"
         if _is_reduction_symbol_name(name) and len([
             s for s in symbols
             if _is_reduction_symbol_name(getattr(s, "name", str(s)))
@@ -1955,10 +2567,15 @@ class TileLangKernel(NPUIndexTritonKernel):
 
     def _reduction_matrix_local_shape_from_index(self, index: sympy.Expr) -> str:
         dims: list[str] = []
+        pointwise_tile_symbol = self._reduction_pointwise_tile_symbol(index)
         for symbol in self._reduction_matrix_symbols(index):
             name = getattr(symbol, "name", str(symbol))
-            if name.startswith("x"):
-                dims.append("_XBLOCK_SUB")
+            if _is_pointwise_symbol_name(name):
+                dims.append(
+                    "_XBLOCK_SUB"
+                    if symbol == pointwise_tile_symbol
+                    else self._reduction_matrix_dim_expr(symbol, index)
+                )
             elif _is_reduction_symbol_name(name):
                 dims.append("_RBLOCK")
             else:
@@ -1966,10 +2583,18 @@ class TileLangKernel(NPUIndexTritonKernel):
         return f"({', '.join(dims)},)"
 
     def _reduction_scalar_local_shape_from_index(self, index: sympy.Expr) -> str:
-        dims = [
-            "_XBLOCK_SUB" if getattr(symbol, "name", str(symbol)).startswith("x") else "1"
-            for symbol in self._reduction_matrix_symbols(index)
-        ]
+        pointwise_tile_symbol = self._reduction_pointwise_tile_symbol(index)
+        dims = []
+        for symbol in self._reduction_matrix_symbols(index):
+            name = getattr(symbol, "name", str(symbol))
+            if _is_pointwise_symbol_name(name):
+                dims.append(
+                    "_XBLOCK_SUB"
+                    if symbol == pointwise_tile_symbol
+                    else self._reduction_matrix_dim_expr(symbol, index)
+                )
+            else:
+                dims.append("1")
         return f"({', '.join(dims)},)"
 
     def _reduction_matrix_reduce_dims_from_index(self, index: sympy.Expr) -> str:
@@ -1982,10 +2607,15 @@ class TileLangKernel(NPUIndexTritonKernel):
 
     def _reduction_matrix_reduce_size_from_index(self, index: sympy.Expr) -> str:
         sizes: list[str] = []
+        pointwise_tile_symbol = self._reduction_pointwise_tile_symbol(index)
         for symbol in self._reduction_matrix_symbols(index):
             name = getattr(symbol, "name", str(symbol))
-            if name.startswith("x"):
-                sizes.append("_XBLOCK_SUB")
+            if _is_pointwise_symbol_name(name):
+                sizes.append(
+                    "_XBLOCK_SUB"
+                    if symbol == pointwise_tile_symbol
+                    else self._reduction_matrix_dim_expr(symbol, index)
+                )
             elif _is_reduction_symbol_name(name):
                 sizes.append("_remain_R")
             else:
@@ -2007,19 +2637,19 @@ class TileLangKernel(NPUIndexTritonKernel):
         index: sympy.Expr,
         pointwise_index: str = "cid",
     ) -> dict[sympy.Symbol, str]:
-        x_symbols = [
+        pointwise_symbols = [
             symbol for symbol in index.free_symbols
-            if getattr(symbol, "name", str(symbol)).startswith("x")
+            if _is_pointwise_symbol_name(getattr(symbol, "name", str(symbol)))
         ]
-        if len(x_symbols) <= 1:
-            return {symbol: pointwise_index for symbol in x_symbols}
+        if len(pointwise_symbols) <= 1:
+            return {symbol: pointwise_index for symbol in pointwise_symbols}
 
         ordered = self._index_symbols_by_stride(
-            sum(symbol * sympy.expand(index).coeff(symbol) for symbol in x_symbols)
+            sum(symbol * sympy.expand(index).coeff(symbol) for symbol in pointwise_symbols)
         )
         ordered = [
             symbol for symbol in ordered
-            if getattr(symbol, "name", str(symbol)).startswith("x")
+            if _is_pointwise_symbol_name(getattr(symbol, "name", str(symbol)))
         ]
         replacements: dict[sympy.Symbol, str] = {}
         factor = 1
@@ -2208,10 +2838,78 @@ class TileLangKernel(NPUIndexTritonKernel):
         prim_fn_name = f"{name or str(Placeholder.KERNEL_NAME)}_prim_fn"
 
         argdefs, _, signature, _ = self.args.python_argdefs()
+        pointwise_ranked_info = self._pointwise_ranked_broadcast_info()
+        pointwise_2d_broadcast_info = (
+            None
+            if pointwise_ranked_info is not None
+            else self._pointwise_2d_broadcast_info()
+        )
+        pointwise_2d_outer = (
+            pointwise_2d_broadcast_info[0]
+            if pointwise_2d_broadcast_info is not None
+            else None
+        )
+        pointwise_2d_inner = (
+            pointwise_2d_broadcast_info[1]
+            if pointwise_2d_broadcast_info is not None
+            else None
+        )
+        pointwise_2d_broadcast_axes = (
+            pointwise_2d_broadcast_info[2]
+            if pointwise_2d_broadcast_info is not None
+            else {}
+        )
+        pointwise_2d_inner_var = (
+            self._static_value_var("B", pointwise_2d_inner)
+            if pointwise_2d_inner is not None
+            else None
+        )
+        pointwise_2d_full_shape = (
+            f"(_ynumel, {pointwise_2d_inner_var})"
+            if pointwise_2d_inner_var is not None
+            else "(_xnumel,)"
+        )
+        pointwise_2d_local_shape = (
+            f"(_YBLOCK, {pointwise_2d_inner_var})"
+            if pointwise_2d_inner_var is not None
+            else "(_XBLOCK_SUB,)"
+        )
+        pointwise_full_shape = (
+            pointwise_ranked_info["full_shape"]
+            if pointwise_ranked_info is not None
+            else pointwise_2d_full_shape
+        )
+        pointwise_local_shape = (
+            pointwise_ranked_info["local_shape"]
+            if pointwise_ranked_info is not None
+            else pointwise_2d_local_shape
+        )
+
         input_shapes = {}
-        for _, (var, loc, _) in self._tl_inputs.items():
+        for name, (var, loc, _) in self._tl_inputs.items():
             kind = self._pointwise_input_kind(loc)
-            if kind == "scalar":
+            if pointwise_ranked_info is not None:
+                input_shapes[var] = pointwise_ranked_info["tensor_shapes"][var]
+            elif pointwise_2d_inner_var is not None and kind == "broadcast":
+                axis = pointwise_2d_broadcast_axes[loc]
+                input_numel = self._tl_input_numels.get(loc)
+                if input_numel is None:
+                    try:
+                        input_numel = sympy_product(V.graph.get_buffer(name).get_size())
+                    except Exception:
+                        input_numel = None
+                input_shapes[var] = (
+                    f"({pointwise_2d_inner_var},)"
+                    if axis == "inner"
+                    else (
+                        f"({self._static_value_var('B', input_numel)},)"
+                        if input_numel is not None
+                        else "(_ynumel,)"
+                    )
+                )
+            elif pointwise_2d_inner_var is not None and kind == "vector":
+                input_shapes[var] = pointwise_2d_full_shape
+            elif kind == "scalar":
                 input_shapes[var] = "(1,)"
             elif kind == "broadcast":
                 input_shapes[var] = self._pointwise_broadcast_shape(loc)
@@ -2221,7 +2919,7 @@ class TileLangKernel(NPUIndexTritonKernel):
         prim_sig_parts: list[str] = []
         for argdef, sig in zip(argdefs, signature):
             if isinstance(sig, TensorArg):
-                shape = input_shapes.get(argdef.name, "(_xnumel,)")
+                shape = input_shapes.get(argdef.name, pointwise_full_shape)
                 prim_sig_parts.append(
                     f"{argdef.name}: T.Tensor({shape}, '{tilelang_dtype(sig.dtype)}')"
                 )
@@ -2316,6 +3014,263 @@ class TileLangKernel(NPUIndexTritonKernel):
                     f"{var}[{base_index}:{base_index} + {copy_len}])"
                 )
 
+        def emit_ranked_pointwise_body(code: IndentedBuffer) -> None:
+            assert pointwise_ranked_info is not None
+            axis_dim_vars: list[str] = pointwise_ranked_info["axis_dim_vars"]
+            axis_deps: dict[str, tuple[int, ...]] = pointwise_ranked_info["axis_deps"]
+            input_positions: dict[str, list[Optional[int]]] = pointwise_ranked_info["input_positions"]
+            local_shape: str = pointwise_ranked_info["local_shape"]
+            axis0_block_var: str = pointwise_ranked_info["axis0_block_var"]
+            rank = len(axis_dim_vars)
+
+            def axis_local_slice(axis_index: int) -> str:
+                if axis_index == 0:
+                    return "0:_tl_remain_axis0"
+                return f"0:{axis_dim_vars[axis_index]}"
+
+            def axis_global_slice(axis_index: int) -> str:
+                if axis_index == 0:
+                    return "_tl_axis0_base:_tl_axis0_base + _tl_remain_axis0"
+                return f"0:{axis_dim_vars[axis_index]}"
+
+            local_slices = [axis_local_slice(i) for i in range(rank)]
+            global_slices = [axis_global_slice(i) for i in range(rank)]
+
+            def ref(name: str, slices: Sequence[str]) -> str:
+                return f"{name}[{', '.join(slices)}]"
+
+            def input_ref(var: str, positions: Sequence[Optional[int]]) -> str:
+                if not positions:
+                    return f"{var}[0]"
+                if positions and all(axis_index is None for axis_index in positions):
+                    if len(positions) == 1:
+                        return f"{var}[0]"
+                    return ref(var, ["0:1" for _ in positions])
+                slices = [
+                    "0:1" if axis_index is None else axis_global_slice(axis_index)
+                    for axis_index in positions
+                ]
+                return ref(var, slices)
+
+            def brc_src_slices(deps: tuple[int, ...]) -> list[str]:
+                dep_set = set(deps)
+                return [
+                    axis_local_slice(axis_index) if axis_index in dep_set else "0:1"
+                    for axis_index in range(rank)
+                ]
+
+            def brc_src_shape(deps: tuple[int, ...]) -> str:
+                dep_set = set(deps)
+                dims = [
+                    (
+                        axis0_block_var
+                        if axis_index == 0
+                        else axis_dim_vars[axis_index]
+                    ) if axis_index in dep_set else "1"
+                    for axis_index in range(rank)
+                ]
+                return self._tilelang_shape_from_dim_strings(dims)
+
+            def axis_local_extent_is_one(axis_index: int) -> bool:
+                if axis_index == 0:
+                    return axis0_block_var == "1"
+                try:
+                    return V.graph.sizevars.statically_known_equals(
+                        pointwise_ranked_info["axis_lengths"][axis_index],
+                        sympy.S.One,
+                    )
+                except Exception:
+                    return False
+
+            def needs_brc(deps: tuple[int, ...]) -> bool:
+                dep_set = set(deps)
+                return any(
+                    not axis_local_extent_is_one(axis_index)
+                    for axis_index in range(rank)
+                    if axis_index not in dep_set
+                )
+
+            # ---- allocate input buffers (L1/shared) ----
+            for _, (var, loc, dtype) in self._tl_inputs.items():
+                deps = axis_deps[loc]
+                if len(deps) != rank and needs_brc(deps):
+                    code.writeline(
+                        f"{loc}_brc_src = T.alloc_shared({brc_src_shape(deps)}, "
+                        f"'{tilelang_dtype(dtype)}')"
+                    )
+                code.writeline(
+                    f"{loc} = T.alloc_shared({local_shape}, "
+                    f"'{tilelang_dtype(dtype)}')"
+                )
+
+            # ---- allocate output buffers (fragment) ----
+            input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
+            for _, (var, loc, dtype) in self._tl_outputs.items():
+                if loc not in input_locs:
+                    code.writeline(
+                        f"{loc} = T.alloc_shared({local_shape}, "
+                        f"'{tilelang_dtype(dtype)}')"
+                    )
+            code.writeline("")
+
+            # ---- T.copy/T.vbrc: GM -> L1 for every input ----
+            for _, (var, loc, _) in self._tl_inputs.items():
+                deps = axis_deps[loc]
+                positions = input_positions[loc]
+                if len(deps) == rank:
+                    code.writeline(
+                        f"T.copy({ref(var, global_slices)}, "
+                        f"{ref(loc, local_slices)})"
+                    )
+                elif not needs_brc(deps):
+                    code.writeline(
+                        f"T.copy({input_ref(var, positions)}, "
+                        f"{ref(loc, brc_src_slices(deps))})"
+                    )
+                else:
+                    code.writeline(
+                        f"T.copy({input_ref(var, positions)}, "
+                        f"{ref(loc + '_brc_src', brc_src_slices(deps))})"
+                    )
+                    code.writeline(f"T.vbrc({loc}_brc_src, {loc})")
+            code.writeline("")
+
+            # ---- emit NPU vector ops ----
+            already_allocated = (
+                {loc for _, loc, _ in self._tl_inputs.values()}
+                | {loc for _, loc, _ in self._tl_outputs.values()}
+            )
+            scalar_cache: dict[tuple[str, str], str] = {}
+            for out_loc, (result_var, dtype) in self._output_vars.items():
+                ops_list: list[tuple] = []
+                _build_vec_ops(
+                    result_var, out_loc, ops_list,
+                    self._var_bufs, self._var_ops, self._var_consts,
+                    self._var_dtypes,
+                )
+
+                if not ops_list:
+                    src = self._var_bufs.get(str(result_var), str(result_var))
+                    if src != out_loc:
+                        code.writeline(f"T.copy({src}, {out_loc})")
+                    continue
+
+                _finalize_vec_ops_output(ops_list, out_loc, dtype)
+
+                self._emit_vec_ops_with_lifetime_reuse(
+                    code,
+                    ops_list,
+                    local_shape,
+                    dtype,
+                    scalar_cache,
+                    already_allocated,
+                )
+
+            code.writeline("")
+
+            # ---- T.copy: fragment -> GM for every output ----
+            for _, (var, loc, _) in self._tl_outputs.items():
+                code.writeline(
+                    f"T.copy({ref(loc, local_slices)}, "
+                    f"{ref(var, global_slices)})"
+                )
+
+        def emit_2d_broadcast_pointwise_body(code: IndentedBuffer) -> None:
+            assert pointwise_2d_inner_var is not None
+
+            # ---- allocate input buffers (L1/shared) ----
+            for _, (var, loc, dtype) in self._tl_inputs.items():
+                kind = self._pointwise_input_kind(loc)
+                if kind == "broadcast":
+                    axis = pointwise_2d_broadcast_axes[loc]
+                    brc_src_shape = (
+                        f"(1, {pointwise_2d_inner_var})"
+                        if axis == "inner"
+                        else "(_YBLOCK, 1)"
+                    )
+                    code.writeline(
+                        f"{loc}_brc_src = T.alloc_shared({brc_src_shape}, "
+                        f"'{tilelang_dtype(dtype)}')"
+                    )
+                code.writeline(
+                    f"{loc} = T.alloc_shared({pointwise_2d_local_shape}, "
+                    f"'{tilelang_dtype(dtype)}')"
+                )
+
+            # ---- allocate output buffers (fragment) ----
+            input_locs = {loc for _, loc, _ in self._tl_inputs.values()}
+            for _, (var, loc, dtype) in self._tl_outputs.items():
+                if loc not in input_locs:
+                    code.writeline(
+                        f"{loc} = T.alloc_shared({pointwise_2d_local_shape}, "
+                        f"'{tilelang_dtype(dtype)}')"
+                    )
+            code.writeline("")
+
+            # ---- T.copy: GM -> L1 for every input ----
+            for _, (var, loc, _) in self._tl_inputs.items():
+                kind = self._pointwise_input_kind(loc)
+                if kind == "broadcast":
+                    axis = pointwise_2d_broadcast_axes[loc]
+                    if axis == "inner":
+                        code.writeline(f"T.copy({var}, {loc}_brc_src[0, :])")
+                    else:
+                        code.writeline(
+                            f"T.copy("
+                            f"{var}[_y_base:_y_base + _remain_Y], "
+                            f"{loc}_brc_src[0:_remain_Y, 0])"
+                        )
+                    code.writeline(f"T.vbrc({loc}_brc_src, {loc})")
+                else:
+                    code.writeline(
+                        f"T.copy("
+                        f"{var}[_y_base:_y_base + _remain_Y, 0:{pointwise_2d_inner_var}], "
+                        f"{loc}[0:_remain_Y, 0:{pointwise_2d_inner_var}])"
+                    )
+            code.writeline("")
+
+            # ---- emit NPU vector ops ----
+            already_allocated = (
+                {loc for _, loc, _ in self._tl_inputs.values()}
+                | {loc for _, loc, _ in self._tl_outputs.values()}
+            )
+            scalar_cache: dict[tuple[str, str], str] = {}
+            for out_loc, (result_var, dtype) in self._output_vars.items():
+                ops_list: list[tuple] = []
+                _build_vec_ops(
+                    result_var, out_loc, ops_list,
+                    self._var_bufs, self._var_ops, self._var_consts,
+                    self._var_dtypes,
+                )
+
+                if not ops_list:
+                    # result_var is a direct input buffer reference (identity)
+                    src = self._var_bufs.get(str(result_var), str(result_var))
+                    if src != out_loc:
+                        code.writeline(f"T.copy({src}, {out_loc})")
+                    continue
+
+                _finalize_vec_ops_output(ops_list, out_loc, dtype)
+
+                self._emit_vec_ops_with_lifetime_reuse(
+                    code,
+                    ops_list,
+                    pointwise_2d_local_shape,
+                    dtype,
+                    scalar_cache,
+                    already_allocated,
+                )
+
+            code.writeline("")
+
+            # ---- T.copy: fragment -> GM for every output ----
+            for _, (var, loc, _) in self._tl_outputs.items():
+                code.writeline(
+                    f"T.copy("
+                    f"{loc}[0:_remain_Y, 0:{pointwise_2d_inner_var}], "
+                    f"{var}[_y_base:_y_base + _remain_Y, 0:{pointwise_2d_inner_var}])"
+                )
+
         def emit_pointwise_prim_func(code: IndentedBuffer) -> None:
             code.writeline("@T.prim_func")
             code.writeline(f"def {prim_fn_name}(")
@@ -2349,14 +3304,69 @@ class TileLangKernel(NPUIndexTritonKernel):
                             "_remain_X",
                         )
 
+        def emit_2d_broadcast_pointwise_prim_func(code: IndentedBuffer) -> None:
+            code.writeline("@T.prim_func")
+            code.writeline(f"def {prim_fn_name}(")
+            with code.indent():
+                for i, part in enumerate(prim_sig_parts):
+                    code.writeline(f"{part}{',' if i < len(prim_sig_parts) - 1 else ''}")
+            code.writeline("):")
+
+            with code.indent():
+                code.writeline(
+                    "with T.Kernel(T.ceildiv(_ynumel, _YBLOCK), is_npu=True) as (cid, _):"
+                )
+                with code.indent():
+                    code.writeline("_y_base = cid * _YBLOCK")
+                    code.writeline("_remain_Y = T.min(_YBLOCK, _ynumel - _y_base)")
+                    emit_2d_broadcast_pointwise_body(code)
+
+        def emit_ranked_pointwise_prim_func(code: IndentedBuffer) -> None:
+            assert pointwise_ranked_info is not None
+            axis_dim_vars: list[str] = pointwise_ranked_info["axis_dim_vars"]
+            axis0_block_var: str = pointwise_ranked_info["axis0_block_var"]
+
+            code.writeline("@T.prim_func")
+            code.writeline(f"def {prim_fn_name}(")
+            with code.indent():
+                for i, part in enumerate(prim_sig_parts):
+                    code.writeline(f"{part}{',' if i < len(prim_sig_parts) - 1 else ''}")
+            code.writeline("):")
+
+            with code.indent():
+                code.writeline(
+                    f"with T.Kernel(T.ceildiv({axis_dim_vars[0]}, {axis0_block_var}), "
+                    "is_npu=True) as (cid, _):"
+                )
+                with code.indent():
+                    code.writeline(f"_tl_axis0_base = cid * {axis0_block_var}")
+                    code.writeline(
+                        f"_tl_remain_axis0 = T.min({axis0_block_var}, "
+                        f"{axis_dim_vars[0]} - _tl_axis0_base)"
+                    )
+                    emit_ranked_pointwise_body(code)
+
         code = IndentedBuffer()
         code.writeline("import tilelang.language as T")
         code.writeline("import math as _math")
         code.writeline("")
         code.writeline("_XBLOCK = X0BLOCK")
         code.writeline("_XBLOCK_SUB = X0BLOCK_SUB")
+        if pointwise_ranked_info is not None:
+            rest_product = pointwise_ranked_info["rest_product"]
+            code.writeline(
+                f"_TL_AXIS0_BLOCK = max(1, _XBLOCK // max(1, {rest_product}))"
+            )
+        if pointwise_2d_inner_var is not None:
+            code.writeline(f"_ynumel = (_xnumel + {pointwise_2d_inner_var} - 1) // {pointwise_2d_inner_var}")
+            code.writeline(f"_YBLOCK = max(1, _XBLOCK // {pointwise_2d_inner_var})")
         code.writeline("")
-        emit_pointwise_prim_func(code)
+        if pointwise_ranked_info is not None:
+            emit_ranked_pointwise_prim_func(code)
+        elif pointwise_2d_inner_var is not None:
+            emit_2d_broadcast_pointwise_prim_func(code)
+        else:
+            emit_pointwise_prim_func(code)
 
         src = code.getvalue()
         print("====== TileLang prim_func ======")
@@ -3154,6 +4164,12 @@ class TileLangKernel(NPUIndexTritonKernel):
         free_buffers: dict[tuple[str, torch.dtype], list[str]] = {}
         if buffer_shapes is None:
             buffer_shapes = {}
+        for _, (_, loc, buffer_dtype) in self._tl_inputs.items():
+            buffer_dtypes[loc] = buffer_dtype
+        for _, (_, loc, buffer_dtype) in self._tl_outputs.items():
+            buffer_dtypes[loc] = buffer_dtype
+        for loc, (_, buffer_dtype) in self._reduction_outputs.items():
+            buffer_dtypes[loc] = buffer_dtype
 
         for op_record in ops_list:
             _, operands, _, _ = _vec_op_parts(op_record)
@@ -3177,6 +4193,32 @@ class TileLangKernel(NPUIndexTritonKernel):
             if not isinstance(operand, str):
                 return None
             return buffer_shapes.get(buffer_map.get(operand, operand))
+
+        def _operand_dtype(operand) -> Optional[torch.dtype]:
+            if not isinstance(operand, str):
+                return None
+            return buffer_dtypes.get(buffer_map.get(operand, operand))
+
+        def _execution_dtype(
+            op_name: str,
+            operands: list,
+            fallback_dtype: torch.dtype,
+        ) -> torch.dtype:
+            if op_name == "copy":
+                return fallback_dtype
+            operand_dtypes = [
+                operand_dtype
+                for operand_dtype in (_operand_dtype(operand) for operand in operands)
+                if operand_dtype is not None
+            ]
+            if not operand_dtypes:
+                return fallback_dtype
+            first_dtype = operand_dtypes[0]
+            if all(operand_dtype == first_dtype for operand_dtype in operand_dtypes):
+                return first_dtype
+            if fallback_dtype in operand_dtypes:
+                return fallback_dtype
+            return first_dtype
 
         def _result_shape(
             op_name: str,
@@ -3224,8 +4266,9 @@ class TileLangKernel(NPUIndexTritonKernel):
 
         for op_record in ops_list:
             op_name, operands, logical_out_buf, _ = _vec_op_parts(op_record)
-            op_dtype = _vec_op_dtype(op_record, dtype)
+            record_dtype = _vec_op_dtype(op_record, dtype)
             resolved_operands = [_resolve_buffer(operand) for operand in operands]
+            op_dtype = _execution_dtype(op_name, resolved_operands, record_dtype)
             shape = _result_shape(op_name, resolved_operands, logical_out_buf)
             out_buf = _allocate_buffer(logical_out_buf, shape, op_dtype)
             emit_op_name = op_name
@@ -3799,6 +4842,16 @@ class TileLangScheduling(NPUTritonScheduling):
         factory_arg_names = shape_factory_arg_names + tiling_arg_names
         outer_arg_list   = tensor_call_args + numel_arg_names
         tilelang_sorted_axis = list(getattr(kernel, "sorted_axis", []) or [])
+        tilelang_pointwise_axis_lengths = (
+            getattr(kernel, "_tl_pointwise_axis_lengths", None)
+            if not is_reduction_kernel
+            else None
+        )
+        tilelang_pointwise_axis_names = (
+            getattr(kernel, "_tl_pointwise_axis_names", None)
+            if tilelang_pointwise_axis_lengths
+            else None
+        )
         tilelang_axis_names = [axis.name for axis in tilelang_sorted_axis]
         tilelang_tiling_axis = [
             axis.sorted_order for axis in getattr(kernel, "tiling_axis", [])
@@ -3813,6 +4866,12 @@ class TileLangScheduling(NPUTritonScheduling):
             if axis.sorted_order is not None
         ]
         tilelang_low_dims = sorted(int(dim) for dim in getattr(kernel, "low_dims", set()))
+        if tilelang_pointwise_axis_lengths and tilelang_pointwise_axis_names:
+            tilelang_axis_names = list(tilelang_pointwise_axis_names)
+            tilelang_tiling_axis = [0]
+            tilelang_no_loop_axis = []
+            tilelang_split_axis = [0]
+            tilelang_low_dims = []
         tilelang_persistent_reduction = bool(getattr(kernel, "persistent_reduction", False))
         try:
             tilelang_dual_reduction = bool(kernel.numof_reduction_axis() > 1)
@@ -3906,11 +4965,40 @@ class TileLangScheduling(NPUTritonScheduling):
                 xnumel_expr = "int(xnumel)" if "xnumel" in numel_arg_names else "1"
                 rnumel_expr = "int(rnumel)" if "rnumel" in numel_arg_names else "1"
                 axis_numel_exprs: list[str] = []
-                for axis in tilelang_sorted_axis:
-                    if axis.prefix == "r":
-                        axis_numel_exprs.append(rnumel_expr)
-                    else:
-                        axis_numel_exprs.append(xnumel_expr)
+                def axis_numel_expr_from_length(length: sympy.Expr) -> str:
+                    simplified_length = V.graph.sizevars.simplify(length)
+                    if isinstance(simplified_length, (sympy.Integer, int)):
+                        return str(int(simplified_length))
+                    for tree in active_trees:
+                        prefix_arg_name = f"{tree.prefix}numel"
+                        if (
+                            prefix_arg_name in numel_arg_names
+                            and V.graph.sizevars.statically_known_equals(
+                                simplified_length,
+                                tree.numel,
+                            )
+                        ):
+                            return f"int({prefix_arg_name})"
+                    return xnumel_expr
+
+                if tilelang_pointwise_axis_lengths:
+                    axis_numel_exprs = [
+                        axis_numel_expr_from_length(length)
+                        for length in tilelang_pointwise_axis_lengths
+                    ]
+                else:
+                    for axis in tilelang_sorted_axis:
+                        if axis.prefix == "r":
+                            axis_numel_exprs.append(rnumel_expr)
+                        else:
+                            prefix_arg_name = f"{axis.prefix}numel"
+                            simplified_length = V.graph.sizevars.simplify(axis.length)
+                            if isinstance(simplified_length, (sympy.Integer, int)):
+                                axis_numel_exprs.append(str(int(simplified_length)))
+                            elif prefix_arg_name in numel_arg_names:
+                                axis_numel_exprs.append(f"int({prefix_arg_name})")
+                            else:
+                                axis_numel_exprs.append(xnumel_expr)
                 if not axis_numel_exprs:
                     axis_numel_exprs = [xnumel_expr, rnumel_expr] if is_reduction_kernel else [xnumel_expr]
                 axis_numels_expr = f"[{', '.join(axis_numel_exprs)}]"

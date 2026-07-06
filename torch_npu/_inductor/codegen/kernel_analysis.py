@@ -248,11 +248,16 @@ class IndexAnalysis:
             if self.var_list not in self.kernel.index_analysis:
                 self.kernel.index_analysis[self.var_list] = self
         # 3. analyze reshape and broadcast sizes
-        else:
-            pass
+        elif self.var_list:
+            self.similar = self.gold
+            self.analyze_reshape_sizes()
+            self.analyze_broadcast_sizes()
 
         # 4 analyze var direction
         self.analyze_var_direction(nddma)
+
+    def has_transform(self):
+        return self.need_reshape or self.need_broadcast or self.need_permute
 
     def generate_statement(self):
         statement = ""
